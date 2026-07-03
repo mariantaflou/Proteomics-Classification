@@ -1,0 +1,678 @@
+\subsection{A.2 LSTM Implementation}
+ 
+\noindent \textbf{Πηγή:} \texttt{Protein\_Network\_FIXED.ipynb}
+ 
+ 
+\subsubsection*{Temporal Protein Network - FIXED VERSION}
+ 
+\subsubsection*{1. Setup}
+ 
+\begin{lstlisting}
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+import matplotlib.pyplot as plt
+import seaborn as sns
+import warnings
+warnings.filterwarnings('ignore')
+ 
+# Device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+ 
+# Reproducibility
+def set_seed(seed=42):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+ 
+set_seed(42)
+print("Setup complete ✓")
+\end{lstlisting}
+ 
+\subsubsection*{2. Configuration}
+ 
+\begin{lstlisting}
+class Config:
+    RANDOM_SEED = 42
+    N_FOLDS = 5
+    N_TOP_FEATURES = 50
+ 
+    # Model - Small
+    HIDDEN_DIM = 32
+    DROPOUT = 0.5
+ 
+    # Training - Conservative
+    BATCH_SIZE = 8
+    LEARNING_RATE = 1e-4
+    WEIGHT_DECAY = 1e-3
+    EPOCHS = 50
+    PATIENCE = 10
+ 
+    DEVICE = device
+ 
+print("Config loaded ✓")
+\end{lstlisting}
+ 
+\subsubsection*{3. Data Loading}
+ 
+\begin{lstlisting}
+# ============================================================
+# ΑΛΛΑΞΕ ΑΥΤΑ ΤΑ PATHS ΣΤΑ ΔΙΚΑ ΣΟΥ ΑΡΧΕΙΑ
+# ============================================================
+SAMPLES_PATH = '/content/DIOPTRA_Samples_list_Oncology.xlsx'
+PROTEINS_PATH = '/content/DIOPTRA_Protein_results_Oncology.xlsx'
+# ============================================================
+\end{lstlisting}
+ 
+\begin{lstlisting}
+def load_data(samples_path, proteins_path, include_t00=True):
+    """
+    Φορτώνει τα δεδομένα.
+    """
+    samples = pd.read_excel(samples_path)
+    proteins = pd.read_excel(proteins_path)
+    data = samples.merge(proteins, on='SampleID')
+ 
+    protein_cols = [c for c in proteins.columns if c != 'SampleID']
+ 
+    # Paired samples (T0 → T1)
+    t0_data = data[data['Timepoint'] == 'T0'].copy()
+    t1_data = data[data['Timepoint'] == 'T1'].copy()
+ 
+    t0_data['PatientID'] = t0_data['SampleID']
+    t1_data['PatientID'] = t1_data['SampleID'].str.replace('-F', '', regex=False)
+ 
+    paired = t0_data.merge(
+        t1_data[['PatientID'] + protein_cols],
+        on='PatientID',
+        suffixes=('_T0', '_T1')
+    )
+    print(f"Paired samples: {len(paired)}")
+ 
+    # Add T00 samples
+    if include_t00:
+        t00_data = data[data['Timepoint'] == 'T00'].copy()
+        for col in protein_cols:
+            t00_data[f'{col}_T0'] = t00_data[col]
+            t00_data[f'{col}_T1'] = t00_data[col]
+        t00_data['PatientID'] = t00_data['SampleID']
+ 
+        cols_needed = ['PatientID', 'Group'] + [f'{c}_T0' for c in protein_cols] + [f'{c}_T1' for c in protein_cols]
+        combined = pd.concat([paired[cols_needed], t00_data[cols_needed]], ignore_index=True)
+        print(f"After adding T00: {len(combined)}")
+    else:
+        combined = paired
+ 
+    # Remove NAA
+    combined = combined[combined['Group'] != 'NAA']
+    print(f"After removing NAA: {len(combined)}")
+ 
+    # Create arrays
+    X_T0 = combined[[f'{c}_T0' for c in protein_cols]].values
+    X_T1 = combined[[f'{c}_T1' for c in protein_cols]].values
+    X = np.stack([X_T0, X_T1], axis=1)  # (n_samples, 2, n_proteins)
+ 
+    # Labels
+    label_encoder = LabelEncoder()
+    y = label_encoder.fit_transform(combined['Group'].values)
+ 
+    print(f"\nClass distribution:")
+    for i, cls in enumerate(label_encoder.classes_):
+        print(f"  {cls}: {(y == i).sum()}")
+ 
+    return X, y, protein_cols, label_encoder
+ 
+ 
+# Load data
+X_raw, y, protein_names, label_encoder = load_data(SAMPLES_PATH, PROTEINS_PATH)
+class_names = list(label_encoder.classes_)
+ 
+print(f"\nX shape: {X_raw.shape}")
+print(f"Classes: {class_names}")
+\end{lstlisting}
+ 
+\subsubsection*{4. Handle NaN Values}
+ 
+\begin{lstlisting}
+# Check for NaN
+print(f"NaN values in X_raw: {np.isnan(X_raw).sum()}")
+print(f"Shape before: {X_raw.shape}")
+ 
+n_samples, n_timepoints, n_proteins = X_raw.shape
+ 
+# Step 1: Find proteins that have at least some valid values
+valid_protein_mask = ~np.all(np.isnan(X_raw), axis=(0, 1))  # True if protein has any valid value
+print(f"\nProteins with ALL NaN (will be removed): {(~valid_protein_mask).sum()}")
+print(f"Valid proteins: {valid_protein_mask.sum()}")
+ 
+# Step 2: Keep only valid proteins
+X_raw = X_raw[:, :, valid_protein_mask]
+protein_names = [p for p, valid in zip(protein_names, valid_protein_mask) if valid]
+ 
+print(f"Shape after removing all-NaN proteins: {X_raw.shape}")
+ 
+# Step 3: Impute remaining NaN with median
+n_samples, n_timepoints, n_proteins = X_raw.shape
+X_imputed = np.zeros_like(X_raw)
+ 
+imputer = SimpleImputer(strategy='median')
+ 
+for t in range(n_timepoints):
+    X_imputed[:, t, :] = imputer.fit_transform(X_raw[:, t, :])
+ 
+X_raw = X_imputed
+ 
+print(f"\nNaN values after imputation: {np.isnan(X_raw).sum()}")
+print(f"Final shape: {X_raw.shape}")
+\end{lstlisting}
+ 
+\subsubsection*{5. Feature Selection}
+ 
+\begin{lstlisting}
+def select_top_features(X, y, protein_names, n_features=50):
+    """
+    Επιλέγει τις top-K πρωτεΐνες με βάση ANOVA F-score.
+    """
+    # Use T0 for feature selection
+    X_t0 = X[:, 0, :]
+ 
+    # Adjust n_features if we have fewer proteins
+    n_features = min(n_features, X_t0.shape[1])
+ 
+    # Select top features
+    selector = SelectKBest(f_classif, k=n_features)
+    selector.fit(X_t0, y)
+ 
+    # Get selected indices
+    selected_mask = selector.get_support()
+    selected_indices = np.where(selected_mask)[0]
+ 
+    # Apply to both timepoints
+    X_selected = X[:, :, selected_indices]
+ 
+    # Get selected protein names
+    selected_proteins = [protein_names[i] for i in selected_indices]
+ 
+    return X_selected, selected_indices, selected_proteins, selector
+ 
+ 
+# Apply feature selection
+X, selected_indices, selected_proteins, feature_selector = select_top_features(
+    X_raw, y, protein_names, n_features=Config.N_TOP_FEATURES
+)
+ 
+print(f"Selected {len(selected_proteins)} proteins")
+print(f"New X shape: {X.shape}")
+print(f"\nTop 10 selected proteins:")
+for i, p in enumerate(selected_proteins[:10]):
+    print(f"  {i+1}. {p}")
+\end{lstlisting}
+ 
+\subsubsection*{6. Normalize Data}
+ 
+\begin{lstlisting}
+def normalize_data(X):
+    """Normalize per feature across all samples and timepoints"""
+    n_samples, n_timepoints, n_features = X.shape
+    X_flat = X.reshape(-1, n_features)
+ 
+    scaler = StandardScaler()
+    X_flat_scaled = scaler.fit_transform(X_flat)
+ 
+    # Clip extreme values
+    X_flat_scaled = np.clip(X_flat_scaled, -5, 5)
+ 
+    return X_flat_scaled.reshape(n_samples, n_timepoints, n_features), scaler
+ 
+ 
+X, scaler = normalize_data(X)
+print(f"Data normalized.")
+print(f"Range: [{X.min():.2f}, {X.max():.2f}]")
+print(f"Any NaN: {np.isnan(X).any()}")
+\end{lstlisting}
+ 
+\subsubsection*{7. Dataset Class}
+ 
+\begin{lstlisting}
+class ProteinDataset(Dataset):
+    def __init__(self, X, y, mode='temporal'):
+        self.y = torch.LongTensor(y)
+ 
+        if mode == 'temporal':
+            self.X = torch.FloatTensor(X)
+        elif mode == 'static':
+            self.X = torch.FloatTensor(X[:, 0:1, :])
+        elif mode == 'delta':
+            delta = X[:, 1, :] - X[:, 0, :]
+            self.X = torch.FloatTensor(delta[:, np.newaxis, :])
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+ 
+    def __len__(self):
+        return len(self.y)
+ 
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+ 
+print("Dataset class defined ✓")
+\end{lstlisting}
+ 
+\subsubsection*{8. Model Architecture}
+ 
+\begin{lstlisting}
+class SimpleTemporalNetwork(nn.Module):
+    """
+    Simplified model for small datasets.
+    """
+ 
+    def __init__(self, n_features, n_timepoints=2, hidden_dim=32, n_classes=3, dropout=0.5):
+        super().__init__()
+ 
+        # Simple 1D Conv
+        self.conv = nn.Sequential(
+            nn.Conv1d(n_timepoints, hidden_dim, kernel_size=5, padding=2),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+ 
+        # Simple LSTM
+        self.lstm = nn.LSTM(
+            input_size=hidden_dim,
+            hidden_size=hidden_dim // 2,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True
+        )
+ 
+        # Attention
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Tanh(),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+ 
+        # Classifier
+        self.classifier = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, n_classes)
+        )
+ 
+    def forward(self, x):
+        # CNN
+        conv_out = self.conv(x)
+ 
+        # LSTM
+        lstm_in = conv_out.transpose(1, 2)
+        lstm_out, _ = self.lstm(lstm_in)
+ 
+        # Attention
+        attn_scores = self.attention(lstm_out)
+        attn_weights = F.softmax(attn_scores, dim=1)
+        context = (lstm_out * attn_weights).sum(dim=1)
+ 
+        # Classify
+        logits = self.classifier(context)
+ 
+        return logits
+ 
+ 
+# Test model
+n_features = X.shape[2]
+test_model = SimpleTemporalNetwork(n_features=n_features, n_classes=len(class_names))
+ 
+n_params = sum(p.numel() for p in test_model.parameters())
+print(f"Model parameters: {n_params:,}")
+print(f"Samples: {len(y)}")
+print(f"Ratio (samples/params): {len(y)/n_params:.2f}")
+ 
+# Test forward
+dummy = torch.randn(4, 2, n_features)
+out = test_model(dummy)
+print(f"Forward pass OK: {dummy.shape} → {out.shape}")
+\end{lstlisting}
+ 
+\subsubsection*{9. Training Functions}
+ 
+\begin{lstlisting}
+def train_epoch(model, loader, optimizer, criterion, device):
+    model.train()
+    total_loss = 0
+    correct = 0
+    total = 0
+ 
+    for X_batch, y_batch in loader:
+        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+ 
+        optimizer.zero_grad()
+        outputs = model(X_batch)
+        loss = criterion(outputs, y_batch)
+ 
+        if torch.isnan(loss):
+            continue
+ 
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+ 
+        total_loss += loss.item()
+        _, predicted = outputs.max(1)
+        correct += (predicted == y_batch).sum().item()
+        total += y_batch.size(0)
+ 
+    avg_loss = total_loss / len(loader) if len(loader) > 0 else 0
+    accuracy = correct / total if total > 0 else 0
+    return avg_loss, accuracy
+ 
+ 
+def evaluate(model, loader, criterion, device):
+    model.eval()
+    total_loss = 0
+    all_preds = []
+    all_targets = []
+ 
+    with torch.no_grad():
+        for X_batch, y_batch in loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            outputs = model(X_batch)
+            loss = criterion(outputs, y_batch)
+ 
+            if not torch.isnan(loss):
+                total_loss += loss.item()
+ 
+            _, predicted = outputs.max(1)
+            all_preds.extend(predicted.cpu().numpy())
+            all_targets.extend(y_batch.cpu().numpy())
+ 
+    avg_loss = total_loss / len(loader) if len(loader) > 0 else 0
+    accuracy = accuracy_score(all_targets, all_preds)
+    return avg_loss, accuracy, np.array(all_preds), np.array(all_targets)
+ 
+print("Training functions defined ✓")
+\end{lstlisting}
+ 
+\subsubsection*{10. Cross-Validation Function}
+ 
+\begin{lstlisting}
+def run_cross_validation(X, y, mode, config, n_folds=5):
+    """
+    Cross-validation για robust evaluation.
+    """
+    print(f"\n{'='*60}")
+    print(f"EXPERIMENT: {mode.upper()} MODEL ({n_folds}-fold CV)")
+    print(f"{'='*60}")
+ 
+    n_timepoints = 2 if mode == 'temporal' else 1
+    n_features = X.shape[2]
+    n_classes = len(np.unique(y))
+ 
+    # Class weights
+    class_counts = np.bincount(y)
+    class_weights = torch.FloatTensor(len(y) / (len(class_counts) * class_counts)).to(config.DEVICE)
+ 
+    # Cross-validation
+    kfold = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=config.RANDOM_SEED)
+ 
+    fold_results = []
+    all_preds = []
+    all_targets = []
+ 
+    for fold, (train_idx, val_idx) in enumerate(kfold.split(X, y)):
+        print(f"\nFold {fold+1}/{n_folds}", end=" ")
+ 
+        # Split
+        X_train, X_val = X[train_idx], X[val_idx]
+        y_train, y_val = y[train_idx], y[val_idx]
+ 
+        # Datasets
+        train_dataset = ProteinDataset(X_train, y_train, mode=mode)
+        val_dataset = ProteinDataset(X_val, y_val, mode=mode)
+ 
+        train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE)
+ 
+        # Model
+        model = SimpleTemporalNetwork(
+            n_features=n_features,
+            n_timepoints=n_timepoints,
+            hidden_dim=config.HIDDEN_DIM,
+            n_classes=n_classes,
+            dropout=config.DROPOUT
+        ).to(config.DEVICE)
+ 
+        # Training setup
+        criterion = nn.CrossEntropyLoss(weight=class_weights)
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=config.LEARNING_RATE,
+            weight_decay=config.WEIGHT_DECAY
+        )
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.5, patience=5
+        )
+ 
+        # Training loop
+        best_val_acc = 0
+        best_model_state = None
+        patience_counter = 0
+ 
+        for epoch in range(config.EPOCHS):
+            train_loss, train_acc = train_epoch(model, train_loader, optimizer, criterion, config.DEVICE)
+            val_loss, val_acc, _, _ = evaluate(model, val_loader, criterion, config.DEVICE)
+ 
+            scheduler.step(val_loss)
+ 
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                patience_counter = 0
+            else:
+                patience_counter += 1
+ 
+            if patience_counter >= config.PATIENCE:
+                break
+ 
+        # Evaluate best model
+        if best_model_state is not None:
+            model.load_state_dict(best_model_state)
+        _, val_acc, preds, targets = evaluate(model, val_loader, criterion, config.DEVICE)
+ 
+        fold_results.append(val_acc)
+        all_preds.extend(preds)
+        all_targets.extend(targets)
+ 
+        print(f"→ Accuracy: {val_acc:.4f}")
+ 
+    # Summary
+    mean_acc = np.mean(fold_results)
+    std_acc = np.std(fold_results)
+ 
+    print(f"\n" + "-"*40)
+    print(f"Mean Accuracy: {mean_acc:.4f} ± {std_acc:.4f}")
+ 
+    return {
+        'mean_acc': mean_acc,
+        'std_acc': std_acc,
+        'fold_results': fold_results,
+        'all_preds': np.array(all_preds),
+        'all_targets': np.array(all_targets)
+    }
+\end{lstlisting}
+ 
+\subsubsection*{11. Run All Experiments ��}
+ 
+\begin{lstlisting}
+# Run all three experiments
+results = {}
+ 
+for mode in ['static', 'delta', 'temporal']:
+    results[mode] = run_cross_validation(X, y, mode, Config, n_folds=Config.N_FOLDS)
+\end{lstlisting}
+ 
+\subsubsection*{12. Results Comparison ��}
+ 
+\begin{lstlisting}
+# Summary table
+print("\n" + "="*60)
+print("FINAL COMPARISON (5-Fold Cross-Validation)")
+print("="*60)
+print(f"\n{'Model':<15} {'Mean Accuracy':<18} {'Std':<10}")
+print("-" * 45)
+ 
+for mode in ['static', 'delta', 'temporal']:
+    mean = results[mode]['mean_acc']
+    std = results[mode]['std_acc']
+    print(f"{mode:<15} {mean:<18.4f} ±{std:<10.4f}")
+ 
+# Baseline comparison
+random_baseline = 1.0 / len(class_names)
+print(f"\n{'random guess':<15} {random_baseline:<18.4f}")
+ 
+# Conclusion
+print("\n" + "-"*45)
+temporal_acc = results['temporal']['mean_acc']
+static_acc = results['static']['mean_acc']
+delta_acc = results['delta']['mean_acc']
+ 
+best_mode = max(['static', 'delta', 'temporal'], key=lambda m: results[m]['mean_acc'])
+print(f"Best model: {best_mode.upper()} ({results[best_mode]['mean_acc']:.4f})")
+ 
+if temporal_acc > static_acc + 0.02:
+    improvement = (temporal_acc - static_acc) * 100
+    print(f"\n✓ Temporal > Static by {improvement:.1f}%")
+    print("  → Evidence that temporal info helps!")
+elif static_acc > temporal_acc + 0.02:
+    print("\n⚠ Static performs better than Temporal")
+    print("  → May need more data for temporal patterns")
+else:
+    print("\n~ Results are similar (within noise)")
+    print("  → Need more data for definitive conclusions")
+\end{lstlisting}
+ 
+\begin{lstlisting}
+# Visualization
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+ 
+# Bar plot comparison
+modes = ['static', 'delta', 'temporal']
+means = [results[m]['mean_acc'] for m in modes]
+stds = [results[m]['std_acc'] for m in modes]
+ 
+colors = ['#3498db', '#e74c3c', '#2ecc71']
+bars = axes[0].bar(modes, means, yerr=stds, capsize=5, color=colors, alpha=0.8)
+axes[0].set_ylabel('Accuracy', fontsize=12)
+axes[0].set_title('Model Comparison (5-Fold CV)', fontsize=14)
+axes[0].set_ylim(0, 1)
+axes[0].axhline(y=1/len(class_names), color='gray', linestyle='--', label='Random guess')
+axes[0].legend()
+axes[0].grid(axis='y', alpha=0.3)
+ 
+# Add values on bars
+for bar, mean, std in zip(bars, means, stds):
+    axes[0].text(bar.get_x() + bar.get_width()/2, mean + std + 0.03,
+                 f'{mean:.3f}', ha='center', fontsize=11, fontweight='bold')
+ 
+# Confusion matrix for best model
+best_mode = max(modes, key=lambda m: results[m]['mean_acc'])
+cm = confusion_matrix(results[best_mode]['all_targets'], results[best_mode]['all_preds'])
+ 
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+            xticklabels=class_names, yticklabels=class_names, ax=axes[1],
+            annot_kws={"size": 14})
+axes[1].set_xlabel('Predicted', fontsize=12)
+axes[1].set_ylabel('True', fontsize=12)
+axes[1].set_title(f'Confusion Matrix ({best_mode.capitalize()} Model)', fontsize=14)
+ 
+plt.tight_layout()
+plt.show()
+\end{lstlisting}
+ 
+\begin{lstlisting}
+# Classification report for best model
+best_mode = max(modes, key=lambda m: results[m]['mean_acc'])
+ 
+print(f"\nClassification Report ({best_mode.capitalize()} Model):")
+print("="*50)
+print(classification_report(
+    results[best_mode]['all_targets'],
+    results[best_mode]['all_preds'],
+    target_names=class_names
+))
+\end{lstlisting}
+ 
+\subsubsection*{13. Top Discriminative Proteins}
+ 
+\begin{lstlisting}
+# Get protein importance scores
+scores = feature_selector.scores_[selected_indices]
+protein_importance = sorted(zip(selected_proteins, scores), key=lambda x: x[1], reverse=True)
+ 
+print("\nTop 20 Most Discriminative Proteins:")
+print("="*45)
+for i, (protein, score) in enumerate(protein_importance[:20]):
+    print(f"{i+1:2d}. {protein:<20} (F-score: {score:.2f})")
+\end{lstlisting}
+ 
+\begin{lstlisting}
+# Visualize top proteins
+top_n = 15
+top_proteins = [p for p, _ in protein_importance[:top_n]]
+top_scores = [s for _, s in protein_importance[:top_n]]
+ 
+fig, ax = plt.subplots(figsize=(10, 6))
+bars = ax.barh(range(top_n), top_scores[::-1], color='steelblue', alpha=0.8)
+ax.set_yticks(range(top_n))
+ax.set_yticklabels(top_proteins[::-1])
+ax.set_xlabel('F-score (ANOVA)', fontsize=12)
+ax.set_title('Top 15 Discriminative Proteins', fontsize=14)
+ax.grid(axis='x', alpha=0.3)
+ 
+plt.tight_layout()
+plt.show()
+\end{lstlisting}
+ 
+\subsubsection*{14. Save Results}
+ 
+\begin{lstlisting}
+# Save results to CSV
+results_df = pd.DataFrame({
+    'Model': ['Static', 'Delta', 'Temporal'],
+    'Mean_Accuracy': [results['static']['mean_acc'], results['delta']['mean_acc'], results['temporal']['mean_acc']],
+    'Std_Accuracy': [results['static']['std_acc'], results['delta']['std_acc'], results['temporal']['std_acc']],
+    'Fold_1': [results['static']['fold_results'][0], results['delta']['fold_results'][0], results['temporal']['fold_results'][0]],
+    'Fold_2': [results['static']['fold_results'][1], results['delta']['fold_results'][1], results['temporal']['fold_results'][1]],
+    'Fold_3': [results['static']['fold_results'][2], results['delta']['fold_results'][2], results['temporal']['fold_results'][2]],
+    'Fold_4': [results['static']['fold_results'][3], results['delta']['fold_results'][3], results['temporal']['fold_results'][3]],
+    'Fold_5': [results['static']['fold_results'][4], results['delta']['fold_results'][4], results['temporal']['fold_results'][4]],
+})
+ 
+results_df.to_csv('experiment_results.csv', index=False)
+print("Results saved to 'experiment_results.csv'")
+display(results_df)
+\end{lstlisting}
+ 
+\begin{lstlisting}
+# Save top proteins
+proteins_df = pd.DataFrame({
+    'Rank': range(1, len(protein_importance) + 1),
+    'Protein': [p for p, _ in protein_importance],
+    'F_score': [s for _, s in protein_importance]
+})
+ 
+proteins_df.to_csv('top_proteins.csv', index=False)
+print("Top proteins saved to 'top_proteins.csv'")
+display(proteins_df.head(20))
+\end{lstlisting}
+ 
+\subsubsection*{Summary}
+ 

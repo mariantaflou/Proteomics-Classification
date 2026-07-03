@@ -1,0 +1,570 @@
+\subsection{A.4 Βελτιστοποίηση \& Hyperparameter Tuning}
+ 
+\noindent \textbf{Πηγή:} \texttt{Optimization\_Experiments.ipynb}
+ 
+ 
+\subsubsection*{Optimization Experiments v2}
+ 
+\begin{lstlisting}
+!pip install xgboost lightgbm imbalanced-learn -q
+print('Installations complete ✓')
+\end{lstlisting}
+ 
+\begin{lstlisting}
+import numpy as np
+import pandas as pd
+import warnings
+warnings.filterwarnings('ignore')
+ 
+from sklearn.model_selection import StratifiedKFold, GridSearchCV
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, confusion_matrix
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier, BaggingClassifier, StackingClassifier, VotingClassifier
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.svm import SVC
+from sklearn.decomposition import PCA
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
+from imblearn.over_sampling import SMOTE
+from scipy.stats import mode
+import matplotlib.pyplot as plt
+import seaborn as sns
+ 
+SEED = 42
+np.random.seed(SEED)
+print('Setup complete ✓')
+\end{lstlisting}
+ 
+\begin{lstlisting}
+SAMPLES_PATH = '/content/DIOPTRA_Samples_list_Oncology.xlsx'
+PROTEINS_PATH = '/content/DIOPTRA_Protein_results_Oncology.xlsx'
+\end{lstlisting}
+ 
+\begin{lstlisting}
+def load_data(samples_path, proteins_path, include_t00=True):
+    samples = pd.read_excel(samples_path)
+    proteins = pd.read_excel(proteins_path)
+    data = samples.merge(proteins, on='SampleID')
+    protein_cols = [c for c in proteins.columns if c != 'SampleID']
+    t0_data = data[data['Timepoint'] == 'T0'].copy()
+    t1_data = data[data['Timepoint'] == 'T1'].copy()
+    t0_data['PatientID'] = t0_data['SampleID']
+    t1_data['PatientID'] = t1_data['SampleID'].str.replace('-F', '', regex=False)
+    paired = t0_data.merge(t1_data[['PatientID'] + protein_cols], on='PatientID', suffixes=('_T0', '_T1'))
+    print(f'Paired samples: {len(paired)}')
+    if include_t00:
+        t00_data = data[data['Timepoint'] == 'T00'].copy()
+        for col in protein_cols:
+            t00_data[f'{col}_T0'] = t00_data[col]
+            t00_data[f'{col}_T1'] = t00_data[col]
+        t00_data['PatientID'] = t00_data['SampleID']
+        cols_needed = ['PatientID', 'Group'] + [f'{c}_T0' for c in protein_cols] + [f'{c}_T1' for c in protein_cols]
+        combined = pd.concat([paired[cols_needed], t00_data[cols_needed]], ignore_index=True)
+        print(f'After adding T00: {len(combined)}')
+    else:
+        combined = paired
+    combined = combined[combined['Group'] != 'NAA']
+    print(f'After removing NAA: {len(combined)}')
+    X_T0 = combined[[f'{c}_T0' for c in protein_cols]].values
+    X_T1 = combined[[f'{c}_T1' for c in protein_cols]].values
+    X = np.stack([X_T0, X_T1], axis=1)
+    label_encoder = LabelEncoder()
+    y = label_encoder.fit_transform(combined['Group'].values)
+    print(f'\nClass distribution:')
+    for i, cls in enumerate(label_encoder.classes_):
+        print(f'  {cls}: {(y == i).sum()}')
+    return X, y, protein_cols, label_encoder
+ 
+X_raw, y, protein_names, label_encoder = load_data(SAMPLES_PATH, PROTEINS_PATH)
+class_names = list(label_encoder.classes_)
+print(f'\nX shape: {X_raw.shape}  |  Classes: {class_names}')
+\end{lstlisting}
+ 
+\begin{lstlisting}
+# Preprocessing
+n_samples, n_timepoints, n_proteins = X_raw.shape
+valid_mask = ~np.all(np.isnan(X_raw), axis=(0, 1))
+X_raw = X_raw[:, :, valid_mask]
+protein_names = [p for p, v in zip(protein_names, valid_mask) if v]
+imputer = SimpleImputer(strategy='median')
+X_imp = np.zeros_like(X_raw)
+for t in range(n_timepoints):
+    X_imp[:, t, :] = imputer.fit_transform(X_raw[:, t, :])
+X_raw = X_imp
+print(f'Preprocessed: {X_raw.shape}')
+\end{lstlisting}
+ 
+\begin{lstlisting}
+# Feature Selection: Top 15
+K = 15
+selector = SelectKBest(f_classif, k=K)
+selector.fit(X_raw[:, 0, :], y)
+selected_idx = np.where(selector.get_support())[0]
+X_selected = X_raw[:, :, selected_idx]
+selected_proteins = [protein_names[i] for i in selected_idx]
+X_T0 = X_selected[:, 0, :]
+X_T1 = X_selected[:, 1, :]
+print(f'Selected {K} proteins')
+\end{lstlisting}
+ 
+\begin{lstlisting}
+# Feature Engineering
+X_delta = X_T1 - X_T0
+X_temporal = np.hstack([X_T0, X_T1])
+X_ratio = np.divide(X_T1, X_T0, out=np.ones_like(X_T0), where=X_T0 != 0)
+X_mean = (X_T0 + X_T1) / 2
+X_abs_delta = np.abs(X_delta)
+ 
+feature_sets = {
+    'Temporal (T0+T1)':      X_temporal,
+    'Full (T0+T1+D)':       np.hstack([X_T0, X_T1, X_delta]),
+    'Enriched (T0+T1+D+R)': np.hstack([X_T0, X_T1, X_delta, X_ratio]),
+    'Kitchen Sink':          np.hstack([X_T0, X_T1, X_delta, X_ratio, X_mean, X_abs_delta]),
+    'Compact (T0+T1+R)':    np.hstack([X_T0, X_T1, X_ratio]),
+    'Ratios Only':           X_ratio,
+    'Delta + Ratio':         np.hstack([X_delta, X_ratio]),
+}
+ 
+print('Feature sets:')
+for name, X in feature_sets.items():
+    print(f'  {name:25s} -> {X.shape[1]} features')
+\end{lstlisting}
+ 
+\begin{lstlisting}
+# Evaluation function - FIXED: all params explicit
+def evaluate_model(model_fn, X, y, model_name='Model', n_folds=5,
+                   normalize=True, use_smote=False):
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=SEED)
+    fold_acc, fold_f1 = [], []
+    all_y_true, all_y_pred = [], []
+    feature_importances = []
+ 
+    for fold, (train_idx, val_idx) in enumerate(skf.split(X, y), 1):
+        X_train, X_val = X[train_idx], X[val_idx]
+        y_train, y_val = y[train_idx], y[val_idx]
+        if normalize:
+            scaler = StandardScaler()
+            X_train = scaler.fit_transform(X_train)
+            X_val = scaler.transform(X_val)
+        if use_smote:
+            try:
+                min_class = min(np.bincount(y_train))
+                k = min(5, min_class - 1)
+                if k >= 1:
+                    sm = SMOTE(random_state=SEED, k_neighbors=k)
+                    X_train, y_train = sm.fit_resample(X_train, y_train)
+            except Exception:
+                pass
+        model = model_fn()
+        model.fit(X_train, y_train)
+        y_pred = model.predict(X_val)
+        acc = accuracy_score(y_val, y_pred)
+        f1 = f1_score(y_val, y_pred, average='weighted', zero_division=0)
+        fold_acc.append(acc)
+        fold_f1.append(f1)
+        all_y_true.extend(y_val)
+        all_y_pred.extend(y_pred)
+        if hasattr(model, 'feature_importances_'):
+            feature_importances.append(model.feature_importances_)
+ 
+    results = {
+        'model': model_name,
+        'mean_acc': np.mean(fold_acc),
+        'std_acc': np.std(fold_acc),
+        'mean_f1': np.mean(fold_f1),
+        'std_f1': np.std(fold_f1),
+        'fold_accs': fold_acc,
+        'y_true': all_y_true,
+        'y_pred': all_y_pred,
+    }
+    print(f'  {model_name:45s} Acc={results["mean_acc"]:.3f}+/-{results["std_acc"]:.3f}  '
+          f'F1={results["mean_f1"]:.3f}')
+    return results
+ 
+print('Evaluation ready ✓')
+\end{lstlisting}
+ 
+\begin{lstlisting}
+# === ΠΕΙΡΑΜΑ 1: Feature Set Comparison ===
+print('='*70)
+print('ΠΕΙΡΑΜΑ 1: Feature Set Comparison (Logistic Regression)')
+print('='*70)
+ 
+feat_results = []
+for name, X_feat in feature_sets.items():
+    r = evaluate_model(
+        lambda: LogisticRegression(max_iter=2000, class_weight='balanced',
+                                   random_state=SEED, solver='lbfgs',
+                                   multi_class='multinomial', C=1.0),
+        X_feat, y, model_name=name, normalize=True
+    )
+    feat_results.append(r)
+ 
+best_feat = max(feat_results, key=lambda x: x['mean_acc'])
+print(f'\n>>> Best feature set: {best_feat["model"]} ({best_feat["mean_acc"]:.3f})')
+\end{lstlisting}
+ 
+\begin{lstlisting}
+best_feat_name = best_feat['model']
+X_best = feature_sets[best_feat_name]
+print(f'Using: {best_feat_name} ({X_best.shape[1]} features)')
+\end{lstlisting}
+ 
+\begin{lstlisting}
+# === ΠΕΙΡΑΜΑ 2: New Models ===
+print('='*70)
+print('ΠΕΙΡΑΜΑ 2: New Models')
+print('='*70)
+ 
+all_results = []
+ 
+r = evaluate_model(
+    lambda: LogisticRegression(max_iter=2000, class_weight='balanced',
+                               random_state=SEED, solver='lbfgs',
+                               multi_class='multinomial'),
+    X_best, y, model_name='LR (baseline)', normalize=True)
+all_results.append(r)
+ 
+r = evaluate_model(
+    lambda: SVC(kernel='rbf', class_weight='balanced',
+                random_state=SEED, C=1.0, gamma='scale'),
+    X_best, y, model_name='SVM (RBF)', normalize=True)
+all_results.append(r)
+ 
+r = evaluate_model(
+    lambda: SVC(kernel='linear', class_weight='balanced',
+                random_state=SEED, C=1.0),
+    X_best, y, model_name='SVM (Linear)', normalize=True)
+all_results.append(r)
+ 
+r = evaluate_model(
+    lambda: XGBClassifier(n_estimators=200, max_depth=3, learning_rate=0.1,
+                          random_state=SEED, eval_metric='mlogloss',
+                          use_label_encoder=False),
+    X_best, y, model_name='XGBoost', normalize=False)
+all_results.append(r)
+ 
+r = evaluate_model(
+    lambda: LGBMClassifier(n_estimators=200, max_depth=3, learning_rate=0.1,
+                           random_state=SEED, verbose=-1,
+                           class_weight='balanced'),
+    X_best, y, model_name='LightGBM', normalize=False)
+all_results.append(r)
+ 
+r = evaluate_model(
+    lambda: RandomForestClassifier(n_estimators=300, class_weight='balanced',
+                                   random_state=SEED, n_jobs=-1),
+    X_best, y, model_name='Random Forest', normalize=False)
+all_results.append(r)
+ 
+r = evaluate_model(
+    lambda: ExtraTreesClassifier(n_estimators=300, class_weight='balanced',
+                                  random_state=SEED, n_jobs=-1),
+    X_best, y, model_name='Extra Trees', normalize=False)
+all_results.append(r)
+\end{lstlisting}
+ 
+\begin{lstlisting}
+# === ΠΕΙΡΑΜΑ 3: Hyperparameter Tuning ===
+print('='*70)
+print('ΠΕΙΡΑΜΑ 3: Hyperparameter Tuning (GridSearchCV)')
+print('='*70)
+ 
+scaler_full = StandardScaler()
+X_best_scaled = scaler_full.fit_transform(X_best)
+cv_inner = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
+ 
+print('\n--- Logistic Regression ---')
+gs_lr = GridSearchCV(
+    LogisticRegression(max_iter=2000, class_weight='balanced',
+                       random_state=SEED, multi_class='multinomial', solver='lbfgs'),
+    {'C': [0.001, 0.01, 0.1, 0.5, 1.0, 5.0, 10.0, 50.0]},
+    cv=cv_inner, scoring='accuracy', n_jobs=-1
+)
+gs_lr.fit(X_best_scaled, y)
+print(f'  Best C={gs_lr.best_params_["C"]}, Acc={gs_lr.best_score_:.3f}')
+ 
+print('\n--- SVM (RBF) ---')
+gs_svm = GridSearchCV(
+    SVC(kernel='rbf', class_weight='balanced', random_state=SEED),
+    {'C': [0.1, 0.5, 1.0, 5.0, 10.0, 50.0],
+     'gamma': ['scale', 'auto', 0.01, 0.1, 0.5]},
+    cv=cv_inner, scoring='accuracy', n_jobs=-1
+)
+gs_svm.fit(X_best_scaled, y)
+print(f'  Best C={gs_svm.best_params_["C"]}, gamma={gs_svm.best_params_["gamma"]}, Acc={gs_svm.best_score_:.3f}')
+ 
+print('\n--- XGBoost ---')
+gs_xgb = GridSearchCV(
+    XGBClassifier(random_state=SEED, eval_metric='mlogloss', use_label_encoder=False),
+    {'n_estimators': [50, 100, 200, 300], 'max_depth': [2, 3, 4, 5],
+     'learning_rate': [0.01, 0.05, 0.1, 0.2]},
+    cv=cv_inner, scoring='accuracy', n_jobs=-1
+)
+gs_xgb.fit(X_best, y)
+print(f'  Best: {gs_xgb.best_params_}, Acc={gs_xgb.best_score_:.3f}')
+ 
+print('\n--- LightGBM ---')
+gs_lgbm = GridSearchCV(
+    LGBMClassifier(random_state=SEED, verbose=-1, class_weight='balanced'),
+    {'n_estimators': [50, 100, 200, 300], 'max_depth': [2, 3, 4, 5, -1],
+     'learning_rate': [0.01, 0.05, 0.1, 0.2], 'num_leaves': [7, 15, 31]},
+    cv=cv_inner, scoring='accuracy', n_jobs=-1
+)
+gs_lgbm.fit(X_best, y)
+print(f'  Best: {gs_lgbm.best_params_}, Acc={gs_lgbm.best_score_:.3f}')
+ 
+print('\n--- Summary ---')
+print(f'  LR:      {gs_lr.best_score_:.3f}')
+print(f'  SVM:     {gs_svm.best_score_:.3f}')
+print(f'  XGBoost: {gs_xgb.best_score_:.3f}')
+print(f'  LightGBM:{gs_lgbm.best_score_:.3f}')
+\end{lstlisting}
+ 
+\begin{lstlisting}
+# === Tuned Models Evaluation ===
+print('='*70)
+print('TUNED MODELS (proper 5-Fold CV)')
+print('='*70)
+ 
+tuned_results = []
+ 
+best_C_lr = gs_lr.best_params_['C']
+r = evaluate_model(
+    lambda: LogisticRegression(max_iter=2000, class_weight='balanced',
+                               random_state=SEED, solver='lbfgs',
+                               multi_class='multinomial', C=best_C_lr),
+    X_best, y, model_name=f'LR tuned (C={best_C_lr})', normalize=True)
+tuned_results.append(r)
+ 
+best_C_svm = gs_svm.best_params_['C']
+best_gamma = gs_svm.best_params_['gamma']
+r = evaluate_model(
+    lambda: SVC(kernel='rbf', class_weight='balanced', random_state=SEED,
+                C=best_C_svm, gamma=best_gamma),
+    X_best, y, model_name=f'SVM tuned (C={best_C_svm})', normalize=True)
+tuned_results.append(r)
+ 
+xgb_params = gs_xgb.best_params_
+r = evaluate_model(
+    lambda: XGBClassifier(**xgb_params, random_state=SEED,
+                          eval_metric='mlogloss', use_label_encoder=False),
+    X_best, y, model_name='XGBoost tuned', normalize=False)
+tuned_results.append(r)
+ 
+lgbm_params = gs_lgbm.best_params_
+r = evaluate_model(
+    lambda: LGBMClassifier(**lgbm_params, random_state=SEED, verbose=-1,
+                           class_weight='balanced'),
+    X_best, y, model_name='LightGBM tuned', normalize=False)
+tuned_results.append(r)
+\end{lstlisting}
+ 
+\begin{lstlisting}
+# === ΠΕΙΡΑΜΑ 4: Stacking & Voting ===
+print('='*70)
+print('ΠΕΙΡΑΜΑ 4: Stacking & Voting')
+print('='*70)
+ 
+r = evaluate_model(
+    lambda: VotingClassifier(
+        estimators=[
+            ('lr', LogisticRegression(max_iter=2000, class_weight='balanced',
+                                      random_state=SEED, C=best_C_lr,
+                                      solver='lbfgs', multi_class='multinomial')),
+            ('svm', SVC(kernel='rbf', class_weight='balanced', random_state=SEED,
+                        C=best_C_svm, gamma=best_gamma, probability=True)),
+            ('rf', RandomForestClassifier(n_estimators=300, class_weight='balanced',
+                                          random_state=SEED)),
+            ('xgb', XGBClassifier(**xgb_params, random_state=SEED,
+                                  eval_metric='mlogloss', use_label_encoder=False)),
+        ],
+        voting='soft'
+    ),
+    X_best, y, model_name='Voting (LR+SVM+RF+XGB)', normalize=True)
+tuned_results.append(r)
+ 
+r = evaluate_model(
+    lambda: StackingClassifier(
+        estimators=[
+            ('lr', LogisticRegression(max_iter=2000, class_weight='balanced',
+                                      random_state=SEED, C=best_C_lr,
+                                      solver='lbfgs', multi_class='multinomial')),
+            ('svm', SVC(kernel='rbf', class_weight='balanced', random_state=SEED,
+                        C=best_C_svm, gamma=best_gamma, probability=True)),
+            ('rf', RandomForestClassifier(n_estimators=300, class_weight='balanced',
+                                          random_state=SEED)),
+            ('xgb', XGBClassifier(**xgb_params, random_state=SEED,
+                                  eval_metric='mlogloss', use_label_encoder=False)),
+        ],
+        final_estimator=LogisticRegression(max_iter=2000, random_state=SEED),
+        cv=3
+    ),
+    X_best, y, model_name='Stacking (LR+SVM+RF+XGB -> LR)', normalize=True)
+tuned_results.append(r)
+ 
+r = evaluate_model(
+    lambda: StackingClassifier(
+        estimators=[
+            ('lr', LogisticRegression(max_iter=2000, class_weight='balanced',
+                                      random_state=SEED, C=best_C_lr,
+                                      solver='lbfgs', multi_class='multinomial')),
+            ('svm', SVC(kernel='rbf', class_weight='balanced', random_state=SEED,
+                        C=best_C_svm, gamma=best_gamma, probability=True)),
+            ('rf', RandomForestClassifier(n_estimators=300, class_weight='balanced',
+                                          random_state=SEED)),
+        ],
+        final_estimator=RandomForestClassifier(n_estimators=100, random_state=SEED),
+        cv=3
+    ),
+    X_best, y, model_name='Stacking (LR+SVM+RF -> RF)', normalize=True)
+tuned_results.append(r)
+\end{lstlisting}
+ 
+\begin{lstlisting}
+# === ΠΕΙΡΑΜΑ 5: SMOTE ===
+print('='*70)
+print('ΠΕΙΡΑΜΑ 5: SMOTE')
+print('='*70)
+ 
+r = evaluate_model(
+    lambda: LogisticRegression(max_iter=2000, class_weight='balanced',
+                               random_state=SEED, C=best_C_lr,
+                               solver='lbfgs', multi_class='multinomial'),
+    X_best, y, model_name='LR tuned + SMOTE', normalize=True, use_smote=True)
+tuned_results.append(r)
+ 
+r = evaluate_model(
+    lambda: SVC(kernel='rbf', class_weight='balanced', random_state=SEED,
+                C=best_C_svm, gamma=best_gamma),
+    X_best, y, model_name='SVM tuned + SMOTE', normalize=True, use_smote=True)
+tuned_results.append(r)
+ 
+r = evaluate_model(
+    lambda: XGBClassifier(**xgb_params, random_state=SEED,
+                          eval_metric='mlogloss', use_label_encoder=False),
+    X_best, y, model_name='XGBoost tuned + SMOTE', normalize=False, use_smote=True)
+tuned_results.append(r)
+\end{lstlisting}
+ 
+\begin{lstlisting}
+# === ΠΕΙΡΑΜΑ 6: Feature Count Sweep ===
+print('='*70)
+print('ΠΕΙΡΑΜΑ 6: Feature Count Sweep')
+print('='*70)
+ 
+k_values = [5, 8, 10, 12, 15, 20, 25, 30, 40, 50]
+k_results = []
+ 
+for k in k_values:
+    k_actual = min(k, X_raw.shape[2])
+    sel = SelectKBest(f_classif, k=k_actual)
+    sel.fit(X_raw[:, 0, :], y)
+    idx = np.where(sel.get_support())[0]
+    X_k = X_raw[:, :, idx]
+    X_k_temp = np.hstack([X_k[:, 0, :], X_k[:, 1, :]])
+ 
+    r = evaluate_model(
+        lambda: LogisticRegression(max_iter=2000, class_weight='balanced',
+                                   random_state=SEED, C=best_C_lr,
+                                   solver='lbfgs', multi_class='multinomial'),
+        X_k_temp, y, model_name=f'LR (K={k_actual})', normalize=True)
+    k_results.append((k_actual, r['mean_acc'], r['std_acc']))
+ 
+fig, ax = plt.subplots(figsize=(10, 5))
+ks, accs, stds = zip(*k_results)
+ax.errorbar(ks, accs, yerr=stds, marker='o', capsize=4, color='#1D9E75', linewidth=2)
+ax.axhline(y=1/3, color='gray', linestyle='--', alpha=0.5, label='Random (33%)')
+ax.set_xlabel('Number of Proteins (K)', fontsize=12)
+ax.set_ylabel('Mean Accuracy', fontsize=12)
+ax.set_title('Accuracy vs Number of Proteins (LR, Temporal)', fontsize=13)
+ax.legend()
+ax.set_xticks(ks)
+plt.tight_layout()
+plt.savefig('feature_count_sweep.png', dpi=150, bbox_inches='tight')
+plt.show()
+best_k = max(k_results, key=lambda x: x[1])
+print(f'\n>>> Best K={best_k[0]}: Acc={best_k[1]:.3f}+/-{best_k[2]:.3f}')
+\end{lstlisting}
+ 
+\begin{lstlisting}
+# === MASTER TABLE ===
+print('\n' + '='*70)
+print('ΤΕΛΙΚΗ ΣΥΓΚΡΙΣΗ')
+print('='*70)
+ 
+all_combined = all_results + tuned_results
+all_combined.sort(key=lambda x: x['mean_acc'], reverse=True)
+ 
+rows = []
+for r in all_combined:
+    rows.append({'Model': r['model'], 'Acc': f"{r['mean_acc']:.3f}",
+                 'Std': f"{r['std_acc']:.3f}", 'F1': f"{r['mean_f1']:.3f}"})
+rows.append({'Model': '--- Deep Learning ---', 'Acc': '---', 'Std': '---', 'F1': '---'})
+rows.append({'Model': 'Vanilla RNN (50 prot)', 'Acc': '0.513', 'Std': '0.116', 'F1': '-'})
+rows.append({'Model': 'LSTM (50 prot)', 'Acc': '0.336', 'Std': '0.081', 'F1': '-'})
+ 
+print(pd.DataFrame(rows).to_string(index=False))
+\end{lstlisting}
+ 
+\begin{lstlisting}
+# === Bar Chart Top 10 ===
+top_n = min(10, len(all_combined))
+top_models = all_combined[:top_n]
+ 
+fig, ax = plt.subplots(figsize=(14, 6))
+models = [r['model'] for r in top_models] + ['Vanilla RNN', 'LSTM']
+accs = [r['mean_acc'] for r in top_models] + [0.513, 0.336]
+stds = [r['std_acc'] for r in top_models] + [0.116, 0.081]
+colors = ['#1D9E75'] * top_n + ['#D85A30'] * 2
+ 
+bars = ax.bar(range(len(models)), accs, yerr=stds, capsize=4,
+              color=colors, edgecolor='white', linewidth=0.5, alpha=0.85)
+ax.axhline(y=1/3, color='gray', linestyle='--', alpha=0.5, label='Random (33%)')
+ax.set_xticks(range(len(models)))
+ax.set_xticklabels(models, rotation=40, ha='right', fontsize=9)
+ax.set_ylabel('Mean Accuracy (5-Fold CV)')
+ax.set_title('Top Models vs Deep Learning')
+ax.set_ylim(0, 1.0)
+ax.legend()
+for bar, acc in zip(bars, accs):
+    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
+            f'{acc:.1%}', ha='center', va='bottom', fontsize=8, fontweight='bold')
+plt.tight_layout()
+plt.savefig('optimization_comparison.png', dpi=150, bbox_inches='tight')
+plt.show()
+\end{lstlisting}
+ 
+\begin{lstlisting}
+# === Save Results ===
+save_rows = []
+for r in all_combined:
+    row = {'Model': r['model'], 'Mean_Accuracy': r['mean_acc'],
+           'Std_Accuracy': r['std_acc'], 'Mean_F1': r['mean_f1']}
+    for i, acc in enumerate(r['fold_accs'], 1):
+        row[f'Fold_{i}'] = acc
+    save_rows.append(row)
+df_save = pd.DataFrame(save_rows)
+df_save.to_csv('optimization_results.csv', index=False)
+print('Saved: optimization_results.csv')
+print(f'Best: {all_combined[0]["model"]} = {all_combined[0]["mean_acc"]:.3f}')
+\end{lstlisting}
+ 
+\begin{lstlisting}
+# === Best Model Confusion Matrix ===
+best = all_combined[0]
+cm = confusion_matrix(best['y_true'], best['y_pred'])
+fig, ax = plt.subplots(figsize=(7, 6))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+            xticklabels=class_names, yticklabels=class_names, ax=ax)
+ax.set_title(f"Best: {best['model']}\nAcc={best['mean_acc']:.3f}")
+ax.set_xlabel('Predicted')
+ax.set_ylabel('True')
+plt.tight_layout()
+plt.savefig('best_model_cm.png', dpi=150, bbox_inches='tight')
+plt.show()
+\end{lstlisting}
+ 

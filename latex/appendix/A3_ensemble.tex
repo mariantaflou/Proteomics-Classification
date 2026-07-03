@@ -1,0 +1,731 @@
+\subsection{A.3 Ensemble Methods \& Custom Cascade Forest}
+ 
+\noindent \textbf{Πηγή:} \texttt{Ensemble\_DeepForest\_Experiments.ipynb}
+ 
+ 
+\subsubsection*{Ensemble \& Deep Forest Experiments}
+ 
+\begin{lstlisting}
+# === Imports ===
+import numpy as np
+import pandas as pd
+import warnings
+warnings.filterwarnings('ignore')
+ 
+from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import (
+    classification_report, confusion_matrix, accuracy_score,
+    f1_score, precision_score, recall_score
+)
+ 
+# Models
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import (
+    RandomForestClassifier, ExtraTreesClassifier, BaggingClassifier
+)
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.decomposition import PCA
+from scipy.stats import mode
+ 
+import matplotlib.pyplot as plt
+import seaborn as sns
+ 
+# Reproducibility
+SEED = 42
+np.random.seed(SEED)
+print('Setup complete ✓')
+\end{lstlisting}
+ 
+\begin{lstlisting}
+# === Configuration ===
+class Config:
+    RANDOM_SEED = 42
+    N_FOLDS = 5
+    N_TOP_FEATURES = 15          # 15 πρωτεΐνες
+ 
+    # Random Forest
+    RF_N_ESTIMATORS = 300
+    RF_MAX_DEPTH = None
+ 
+    # Random Subspace
+    RS_N_ESTIMATORS = 200
+    RS_MAX_FEATURES = 0.5        # 50% features per tree
+ 
+    # Rotation Forest
+    ROT_N_ESTIMATORS = 100
+    ROT_N_GROUPS = 3             # 15 features / 3 = 5 per group
+ 
+    # Custom Cascade Forest
+    DF_N_TREES = 100
+    DF_MAX_LAYERS = 10
+ 
+print('Config loaded ✓')
+\end{lstlisting}
+ 
+\begin{lstlisting}
+# ============================================================
+# ΑΛΛΑΞΕ ΑΥΤΑ ΤΑ PATHS ΣΤΑ ΔΙΚΑ ΣΟΥ ΑΡΧΕΙΑ
+# ============================================================
+SAMPLES_PATH = '/content/DIOPTRA_Samples_list_Oncology.xlsx'
+PROTEINS_PATH = '/content/DIOPTRA_Protein_results_Oncology.xlsx'
+# ============================================================
+\end{lstlisting}
+ 
+\begin{lstlisting}
+# === Φόρτωση Δεδομένων (ίδιο pipeline με τα RNN notebooks) ===
+ 
+def load_data(samples_path, proteins_path, include_t00=True):
+    samples = pd.read_excel(samples_path)
+    proteins = pd.read_excel(proteins_path)
+    data = samples.merge(proteins, on='SampleID')
+    protein_cols = [c for c in proteins.columns if c != 'SampleID']
+ 
+    # Paired samples (T0 → T1)
+    t0_data = data[data['Timepoint'] == 'T0'].copy()
+    t1_data = data[data['Timepoint'] == 'T1'].copy()
+    t0_data['PatientID'] = t0_data['SampleID']
+    t1_data['PatientID'] = t1_data['SampleID'].str.replace('-F', '', regex=False)
+ 
+    paired = t0_data.merge(
+        t1_data[['PatientID'] + protein_cols],
+        on='PatientID', suffixes=('_T0', '_T1')
+    )
+    print(f'Paired samples: {len(paired)}')
+ 
+    if include_t00:
+        t00_data = data[data['Timepoint'] == 'T00'].copy()
+        for col in protein_cols:
+            t00_data[f'{col}_T0'] = t00_data[col]
+            t00_data[f'{col}_T1'] = t00_data[col]
+        t00_data['PatientID'] = t00_data['SampleID']
+        cols_needed = ['PatientID', 'Group'] + [f'{c}_T0' for c in protein_cols] + [f'{c}_T1' for c in protein_cols]
+        combined = pd.concat([paired[cols_needed], t00_data[cols_needed]], ignore_index=True)
+        print(f'After adding T00: {len(combined)}')
+    else:
+        combined = paired
+ 
+    combined = combined[combined['Group'] != 'NAA']
+    print(f'After removing NAA: {len(combined)}')
+ 
+    X_T0 = combined[[f'{c}_T0' for c in protein_cols]].values
+    X_T1 = combined[[f'{c}_T1' for c in protein_cols]].values
+    X = np.stack([X_T0, X_T1], axis=1)
+ 
+    label_encoder = LabelEncoder()
+    y = label_encoder.fit_transform(combined['Group'].values)
+ 
+    print(f'\nClass distribution:')
+    for i, cls in enumerate(label_encoder.classes_):
+        print(f'  {cls}: {(y == i).sum()}')
+ 
+    return X, y, protein_cols, label_encoder
+ 
+X_raw, y, protein_names, label_encoder = load_data(SAMPLES_PATH, PROTEINS_PATH)
+class_names = list(label_encoder.classes_)
+print(f'\nX shape: {X_raw.shape}  |  Classes: {class_names}')
+\end{lstlisting}
+ 
+\begin{lstlisting}
+# === Προεπεξεργασία: NaN handling + Feature Selection (15 proteins) ===
+ 
+# Βήμα 1: Αφαίρεση πρωτεϊνών με μόνο NaN
+n_samples, n_timepoints, n_proteins = X_raw.shape
+valid_mask = ~np.all(np.isnan(X_raw), axis=(0, 1))
+X_raw = X_raw[:, :, valid_mask]
+protein_names = [p for p, v in zip(protein_names, valid_mask) if v]
+print(f'Valid proteins: {X_raw.shape[2]}')
+ 
+# Βήμα 2: Median Imputation
+imputer = SimpleImputer(strategy='median')
+X_imp = np.zeros_like(X_raw)
+for t in range(n_timepoints):
+    X_imp[:, t, :] = imputer.fit_transform(X_raw[:, t, :])
+X_raw = X_imp
+print(f'NaN after imputation: {np.isnan(X_raw).sum()}')
+ 
+# Βήμα 3: Feature Selection - Top 15 πρωτεΐνες (ANOVA F-score)
+selector = SelectKBest(f_classif, k=Config.N_TOP_FEATURES)
+selector.fit(X_raw[:, 0, :], y)  # Χρήση T0 για selection
+selected_mask = selector.get_support()
+selected_idx = np.where(selected_mask)[0]
+ 
+X_selected = X_raw[:, :, selected_idx]
+selected_proteins = [protein_names[i] for i in selected_idx]
+ 
+print(f'\nSelected {len(selected_proteins)} proteins:')
+f_scores = selector.scores_[selected_idx]
+for rank, (p, f) in enumerate(sorted(zip(selected_proteins, f_scores), key=lambda x: -x[1]), 1):
+    print(f'  {rank:2d}. {p:<12s} F={f:.2f}')
+ 
+print(f'\nX_selected shape: {X_selected.shape}')
+\end{lstlisting}
+ 
+\begin{lstlisting}
+# === Κατασκευή Feature Matrices για κάθε Mode ===
+ 
+X_T0 = X_selected[:, 0, :]                           # (N, 15) - Static
+X_T1 = X_selected[:, 1, :]                           # (N, 15)
+X_delta = X_T1 - X_T0                                # (N, 15) - Delta
+X_temporal = np.hstack([X_T0, X_T1])                 # (N, 30) - Temporal
+X_full = np.hstack([X_T0, X_T1, X_delta])            # (N, 45) - Full
+ 
+print('Feature matrices:')
+print(f'  X_T0 (Static):      {X_T0.shape}')
+print(f'  X_delta (Delta):    {X_delta.shape}')
+print(f'  X_temporal (T0+T1): {X_temporal.shape}')
+print(f'  X_full (T0+T1+Δ):  {X_full.shape}')
+\end{lstlisting}
+ 
+\subsubsection*{Βοηθητικές Συναρτήσεις \& Custom Models}
+ 
+\begin{lstlisting}
+# === Evaluation Framework ===
+ 
+def evaluate_model(model_fn, X, y, n_folds=5, model_name='Model', normalize=True):
+    """
+    Αξιολόγηση μοντέλου με Stratified K-Fold CV.
+    """
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=Config.RANDOM_SEED)
+ 
+    fold_acc, fold_f1, fold_precision, fold_recall = [], [], [], []
+    all_y_true, all_y_pred = [], []
+    feature_importances = []
+ 
+    for fold, (train_idx, val_idx) in enumerate(skf.split(X, y), 1):
+        X_train, X_val = X[train_idx], X[val_idx]
+        y_train, y_val = y[train_idx], y[val_idx]
+ 
+        # Normalization ανά fold (αποφυγή data leakage)
+        if normalize:
+            scaler = StandardScaler()
+            X_train = scaler.fit_transform(X_train)
+            X_val = scaler.transform(X_val)
+ 
+        # Train & Predict
+        model = model_fn()
+        model.fit(X_train, y_train)
+        y_pred = model.predict(X_val)
+ 
+        # Metrics
+        acc = accuracy_score(y_val, y_pred)
+        f1 = f1_score(y_val, y_pred, average='weighted', zero_division=0)
+        prec = precision_score(y_val, y_pred, average='weighted', zero_division=0)
+        rec = recall_score(y_val, y_pred, average='weighted', zero_division=0)
+ 
+        fold_acc.append(acc)
+        fold_f1.append(f1)
+        fold_precision.append(prec)
+        fold_recall.append(rec)
+        all_y_true.extend(y_val)
+        all_y_pred.extend(y_pred)
+ 
+        if hasattr(model, 'feature_importances_'):
+            feature_importances.append(model.feature_importances_)
+ 
+        print(f'  Fold {fold}: Acc={acc:.3f}  F1={f1:.3f}')
+ 
+    results = {
+        'model': model_name,
+        'mean_acc': np.mean(fold_acc),
+        'std_acc': np.std(fold_acc),
+        'mean_f1': np.mean(fold_f1),
+        'std_f1': np.std(fold_f1),
+        'mean_precision': np.mean(fold_precision),
+        'mean_recall': np.mean(fold_recall),
+        'fold_accs': fold_acc,
+        'y_true': all_y_true,
+        'y_pred': all_y_pred,
+        'feature_importances': np.mean(feature_importances, axis=0) if feature_importances else None
+    }
+ 
+    print(f'  >>> {model_name}: Acc={results["mean_acc"]:.3f}±{results["std_acc"]:.3f}  '
+          f'F1={results["mean_f1"]:.3f}±{np.std(fold_f1):.3f}')
+    return results
+ 
+print('Evaluation framework ready ✓')
+\end{lstlisting}
+ 
+\begin{lstlisting}
+# === Rotation Forest Implementation ===
+ 
+class RotationForestClassifier:
+    """
+    Rotation Forest (Rodriguez et al., 2006)
+    Χωρίζει features σε ομάδες → PCA ανά ομάδα → Decision Tree
+    """
+    def __init__(self, n_estimators=100, n_groups=3, random_state=42):
+        self.n_estimators = n_estimators
+        self.n_groups = n_groups
+        self.random_state = random_state
+        self.trees = []
+        self.rotations = []
+        self.feature_groups = []
+ 
+    def fit(self, X, y):
+        rng = np.random.RandomState(self.random_state)
+        n_features = X.shape[1]
+        self.trees = []
+        self.rotations = []
+        self.feature_groups = []
+ 
+        for i in range(self.n_estimators):
+            # Τυχαίος χωρισμός features σε ομάδες
+            perm = rng.permutation(n_features)
+            groups = np.array_split(perm, self.n_groups)
+ 
+            # PCA σε κάθε ομάδα (σε bootstrap subset)
+            pca_list = []
+            for group in groups:
+                boot_idx = rng.choice(len(X), size=int(0.75 * len(X)), replace=True)
+                X_subset = X[boot_idx][:, group]
+                pca = PCA(n_components=len(group))
+                pca.fit(X_subset)
+                pca_list.append(pca)
+ 
+            # Μετασχηματισμός & εκπαίδευση
+            X_rotated = self._transform(X, groups, pca_list)
+            tree = DecisionTreeClassifier(random_state=self.random_state + i)
+            tree.fit(X_rotated, y)
+ 
+            self.trees.append(tree)
+            self.rotations.append(pca_list)
+            self.feature_groups.append(groups)
+        return self
+ 
+    def _transform(self, X, groups, pca_list):
+        parts = [pca.transform(X[:, group]) for group, pca in zip(groups, pca_list)]
+        return np.hstack(parts)
+ 
+    def predict(self, X):
+        predictions = np.array([
+            tree.predict(self._transform(X, groups, pcas))
+            for tree, groups, pcas in zip(self.trees, self.feature_groups, self.rotations)
+        ])
+        return mode(predictions, axis=0, keepdims=False).mode
+ 
+print('Rotation Forest ready ✓')
+\end{lstlisting}
+ 
+\begin{lstlisting}
+# === Custom Cascade Forest Implementation ===
+ 
+class CustomCascadeForest:
+    """
+    Custom Cascade Forest (Zhou & Feng, 2017) - sklearn only.
+    Κάθε layer: [RF, RF, ExtraTrees, ExtraTrees]
+    Probabilities (μέσω CV) concatenate με αρχικά features → επόμενο layer.
+    Auto-stop όταν δεν βελτιώνεται.
+    """
+    def __init__(self, n_trees=100, max_layers=10, random_state=42):
+        self.n_trees = n_trees
+        self.max_layers = max_layers
+        self.random_state = random_state
+        self.layers = []
+        self.n_classes_ = None
+ 
+    def _create_forests(self, seed):
+        return [
+            RandomForestClassifier(n_estimators=self.n_trees, random_state=seed),
+            RandomForestClassifier(n_estimators=self.n_trees, random_state=seed+1),
+            ExtraTreesClassifier(n_estimators=self.n_trees, random_state=seed+2),
+            ExtraTreesClassifier(n_estimators=self.n_trees, random_state=seed+3),
+        ]
+ 
+    def _get_cv_probas(self, X, y, seed):
+        """Class probabilities μέσω 3-fold CV (αποφυγή leakage)"""
+        n_forests = 4
+        probas = np.zeros((len(X), self.n_classes_ * n_forests))
+        kf = StratifiedKFold(n_splits=3, shuffle=True, random_state=self.random_state)
+ 
+        for f_idx in range(n_forests):
+            proba_col = np.zeros((len(X), self.n_classes_))
+            for tr_idx, va_idx in kf.split(X, y):
+                if f_idx < 2:
+                    clf = RandomForestClassifier(n_estimators=self.n_trees, random_state=seed+f_idx)
+                else:
+                    clf = ExtraTreesClassifier(n_estimators=self.n_trees, random_state=seed+f_idx)
+                clf.fit(X[tr_idx], y[tr_idx])
+                proba_col[va_idx] = clf.predict_proba(X[va_idx])
+            probas[:, f_idx*self.n_classes_:(f_idx+1)*self.n_classes_] = proba_col
+ 
+        return probas
+ 
+    def fit(self, X, y):
+        self.layers = []
+        self.n_classes_ = len(np.unique(y))
+        self.X_original_dim = X.shape[1]
+ 
+        X_current = X.copy()
+        best_acc = 0
+        patience = 0
+ 
+        for layer_idx in range(self.max_layers):
+            seed = self.random_state + layer_idx * 10
+ 
+            # CV probabilities για augmentation
+            probas = self._get_cv_probas(X_current, y, seed)
+ 
+            # Layer accuracy (average of 4 forests)
+            avg_proba = np.zeros((len(X), self.n_classes_))
+            for f_idx in range(4):
+                avg_proba += probas[:, f_idx*self.n_classes_:(f_idx+1)*self.n_classes_]
+            avg_proba /= 4
+            layer_acc = accuracy_score(y, np.argmax(avg_proba, axis=1))
+            print(f'    Layer {layer_idx+1}: Acc={layer_acc:.3f}')
+ 
+            # Train forests on full data (for prediction)
+            forests = self._create_forests(seed)
+            for forest in forests:
+                forest.fit(X_current, y)
+            self.layers.append(forests)
+ 
+            # Early stopping
+            if layer_acc > best_acc + 0.001:
+                best_acc = layer_acc
+                patience = 0
+            else:
+                patience += 1
+                if patience >= 2:
+                    print(f'    Early stop at layer {layer_idx+1}')
+                    break
+ 
+            # Augment: original features + probabilities
+            X_current = np.hstack([X, probas])
+ 
+        return self
+ 
+    def predict(self, X):
+        X_current = X.copy()
+ 
+        for forests in self.layers:
+            probas_list = []
+            for forest in forests:
+                # Fit ήταν σε X_current, predict πρέπει στο ίδιο dim
+                n_expected = forest.n_features_in_
+                X_input = X_current[:, :n_expected] if X_current.shape[1] > n_expected else X_current
+                probas_list.append(forest.predict_proba(X_input))
+ 
+            all_probas = np.hstack(probas_list)
+            X_current = np.hstack([X, all_probas])
+ 
+        # Final: average probabilities from last layer
+        avg_proba = np.mean(probas_list, axis=0)
+        return np.argmax(avg_proba, axis=1)
+ 
+print('Custom Cascade Forest ready ✓')
+\end{lstlisting}
+ 
+\subsubsection*{Εκτέλεση Πειραμάτων}
+ 
+\begin{lstlisting}
+# Αποθήκευση αποτελεσμάτων
+all_results = []
+ 
+# Κύριο input: T0 + T1 concatenated
+X_main = X_temporal
+input_label = 'Temporal (T0+T1)'
+print(f'Main input: {input_label}, shape={X_main.shape}')
+\end{lstlisting}
+ 
+\begin{lstlisting}
+# === 1. Logistic Regression ===
+print('='*60)
+print('1. LOGISTIC REGRESSION')
+print('='*60)
+ 
+res = evaluate_model(
+    model_fn=lambda: LogisticRegression(
+        max_iter=1000,
+        class_weight='balanced',
+        random_state=Config.RANDOM_SEED,
+        C=1.0,
+        solver='lbfgs',
+        multi_class='multinomial'
+    ),
+    X=X_main, y=y,
+    model_name='Logistic Regression',
+    normalize=True
+)
+all_results.append(res)
+\end{lstlisting}
+ 
+\begin{lstlisting}
+# === 2. Random Forest ===
+print('='*60)
+print('2. RANDOM FOREST')
+print('='*60)
+ 
+res = evaluate_model(
+    model_fn=lambda: RandomForestClassifier(
+        n_estimators=Config.RF_N_ESTIMATORS,
+        max_depth=Config.RF_MAX_DEPTH,
+        class_weight='balanced',
+        random_state=Config.RANDOM_SEED,
+        n_jobs=-1
+    ),
+    X=X_main, y=y,
+    model_name='Random Forest',
+    normalize=False
+)
+all_results.append(res)
+\end{lstlisting}
+ 
+\begin{lstlisting}
+# === 3. Random Subspace (Feature Bagging) ===
+print('='*60)
+print('3. RANDOM SUBSPACE (Feature Bagging)')
+print('='*60)
+ 
+res = evaluate_model(
+    model_fn=lambda: BaggingClassifier(
+        estimator=DecisionTreeClassifier(),
+        n_estimators=Config.RS_N_ESTIMATORS,
+        max_features=Config.RS_MAX_FEATURES,
+        bootstrap=True,
+        bootstrap_features=True,
+        random_state=Config.RANDOM_SEED,
+        n_jobs=-1
+    ),
+    X=X_main, y=y,
+    model_name='Random Subspace',
+    normalize=False
+)
+all_results.append(res)
+\end{lstlisting}
+ 
+\begin{lstlisting}
+# === 4. Rotation Forest ===
+print('='*60)
+print('4. ROTATION FOREST')
+print('='*60)
+ 
+res = evaluate_model(
+    model_fn=lambda: RotationForestClassifier(
+        n_estimators=Config.ROT_N_ESTIMATORS,
+        n_groups=Config.ROT_N_GROUPS,
+        random_state=Config.RANDOM_SEED
+    ),
+    X=X_main, y=y,
+    model_name='Rotation Forest',
+    normalize=True
+)
+all_results.append(res)
+\end{lstlisting}
+ 
+\begin{lstlisting}
+# === 5. Custom Cascade Forest (Deep Forest) ===
+print('='*60)
+print('5. CUSTOM CASCADE FOREST (Deep Forest)')
+print('='*60)
+ 
+res = evaluate_model(
+    model_fn=lambda: CustomCascadeForest(
+        n_trees=Config.DF_N_TREES,
+        max_layers=Config.DF_MAX_LAYERS,
+        random_state=Config.RANDOM_SEED
+    ),
+    X=X_main, y=y,
+    model_name='Cascade Forest (Custom)',
+    normalize=False
+)
+all_results.append(res)
+\end{lstlisting}
+ 
+\subsubsection*{Συγκριτικά Αποτελέσματα}
+ 
+\begin{lstlisting}
+# === Συγκριτικός Πίνακας ===
+ 
+# Προσθήκη RNN/LSTM αποτελεσμάτων (από προηγούμενα πειράματα)
+rnn_results = [
+    {'model': 'Vanilla RNN (50 prot)', 'mean_acc': 0.513, 'std_acc': 0.116},
+    {'model': 'LSTM (50 prot)', 'mean_acc': 0.336, 'std_acc': 0.081},
+]
+ 
+# Δημιουργία DataFrame
+rows = []
+for r in all_results:
+    rows.append({
+        'Model': r['model'],
+        'Mean Acc': f"{r['mean_acc']:.3f}",
+        'Std Acc': f"{r['std_acc']:.3f}",
+        'Mean F1': f"{r['mean_f1']:.3f}",
+        'Mean Prec': f"{r['mean_precision']:.3f}",
+        'Mean Rec': f"{r['mean_recall']:.3f}",
+    })
+for r in rnn_results:
+    rows.append({
+        'Model': r['model'],
+        'Mean Acc': f"{r['mean_acc']:.3f}",
+        'Std Acc': f"{r['std_acc']:.3f}",
+        'Mean F1': '-', 'Mean Prec': '-', 'Mean Rec': '-',
+    })
+ 
+df_results = pd.DataFrame(rows)
+print('\n' + '='*70)
+print('ΣΥΓΚΡΙΤΙΚΟΣ ΠΙΝΑΚΑΣ ΑΠΟΤΕΛΕΣΜΑΤΩΝ')
+print(f'Input: {input_label} | Features: {X_main.shape[1]} | N={len(y)} | 5-Fold CV')
+print('='*70)
+print(df_results.to_string(index=False))
+print('='*70)
+\end{lstlisting}
+ 
+\begin{lstlisting}
+# === Bar Chart Σύγκρισης ===
+ 
+fig, ax = plt.subplots(figsize=(12, 6))
+ 
+models = [r['model'] for r in all_results]
+accs = [r['mean_acc'] for r in all_results]
+stds = [r['std_acc'] for r in all_results]
+ 
+# Add RNN/LSTM
+models += ['Vanilla RNN', 'LSTM']
+accs += [0.513, 0.336]
+stds += [0.116, 0.081]
+ 
+# Colors: ensemble = teal, DL = coral
+colors = ['#1D9E75'] * len(all_results) + ['#D85A30'] * 2
+ 
+bars = ax.bar(range(len(models)), accs, yerr=stds, capsize=4,
+              color=colors, edgecolor='white', linewidth=0.5, alpha=0.85)
+ 
+ax.axhline(y=1/3, color='gray', linestyle='--', alpha=0.5, label='Random (33%)')
+ 
+ax.set_xticks(range(len(models)))
+ax.set_xticklabels(models, rotation=35, ha='right', fontsize=10)
+ax.set_ylabel('Mean Accuracy (5-Fold CV)', fontsize=12)
+ax.set_title('Σύγκριση Μεθόδων: Ensemble vs Deep Learning\n'
+             f'(15 πρωτεΐνες, N={len(y)}, 3 κλάσεις)', fontsize=13)
+ax.set_ylim(0, 1.0)
+ax.legend()
+ 
+for bar, acc in zip(bars, accs):
+    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.03,
+            f'{acc:.1%}', ha='center', va='bottom', fontsize=9, fontweight='bold')
+ 
+plt.tight_layout()
+plt.savefig('model_comparison.png', dpi=150, bbox_inches='tight')
+plt.show()
+print('Saved: model_comparison.png')
+\end{lstlisting}
+ 
+\begin{lstlisting}
+# === Confusion Matrices ===
+ 
+n_models = len(all_results)
+n_cols = 3
+n_rows = (n_models + n_cols - 1) // n_cols
+fig, axes = plt.subplots(n_rows, n_cols, figsize=(16, 5 * n_rows))
+axes = axes.flatten()
+ 
+for idx, r in enumerate(all_results):
+    cm = confusion_matrix(r['y_true'], r['y_pred'])
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=class_names, yticklabels=class_names,
+                ax=axes[idx])
+    axes[idx].set_title(f"{r['model']}\nAcc={r['mean_acc']:.3f}", fontsize=11)
+    axes[idx].set_xlabel('Predicted')
+    axes[idx].set_ylabel('True')
+ 
+for idx in range(n_models, len(axes)):
+    axes[idx].set_visible(False)
+ 
+plt.suptitle('Confusion Matrices - Ensemble Methods (5-Fold CV, Aggregated)', fontsize=14, y=1.02)
+plt.tight_layout()
+plt.savefig('confusion_matrices.png', dpi=150, bbox_inches='tight')
+plt.show()
+\end{lstlisting}
+ 
+\begin{lstlisting}
+# === Feature Importance (Random Forest) ===
+ 
+rf_result = [r for r in all_results if r['model'] == 'Random Forest'][0]
+ 
+if rf_result['feature_importances'] is not None:
+    feat_names = ([f'{p}_T0' for p in selected_proteins] +
+                  [f'{p}_T1' for p in selected_proteins])
+ 
+    importances = rf_result['feature_importances']
+    sorted_idx = np.argsort(importances)[::-1][:20]
+ 
+    fig, ax = plt.subplots(figsize=(10, 8))
+    ax.barh(range(len(sorted_idx)), importances[sorted_idx][::-1],
+            color='#1D9E75', alpha=0.8)
+    ax.set_yticks(range(len(sorted_idx)))
+    ax.set_yticklabels([feat_names[i] for i in sorted_idx][::-1], fontsize=10)
+    ax.set_xlabel('Feature Importance (MDI)', fontsize=12)
+    ax.set_title('Top 20 Feature Importances (Random Forest)', fontsize=13)
+    plt.tight_layout()
+    plt.savefig('feature_importance_rf.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    print('Saved: feature_importance_rf.png')
+\end{lstlisting}
+ 
+\begin{lstlisting}
+# === Αποθήκευση σε CSV ===
+ 
+detailed_rows = []
+for r in all_results:
+    row = {
+        'Model': r['model'],
+        'Mean_Accuracy': r['mean_acc'],
+        'Std_Accuracy': r['std_acc'],
+        'Mean_F1': r['mean_f1'],
+        'Mean_Precision': r['mean_precision'],
+        'Mean_Recall': r['mean_recall'],
+    }
+    for i, acc in enumerate(r['fold_accs'], 1):
+        row[f'Fold_{i}'] = acc
+    detailed_rows.append(row)
+ 
+df_detailed = pd.DataFrame(detailed_rows)
+df_detailed.to_csv('ensemble_results.csv', index=False)
+print('Saved: ensemble_results.csv')
+print(df_detailed.to_string(index=False))
+\end{lstlisting}
+ 
+\begin{lstlisting}
+# === BONUS: Static vs Temporal σύγκριση ===
+print('\n' + '='*70)
+print('BONUS: Static (T0) vs Temporal (T0+T1) σύγκριση')
+print('='*70)
+ 
+comparison_rows = []
+ 
+models_to_compare = [
+    ('Logistic Regression', lambda: LogisticRegression(
+        max_iter=1000, class_weight='balanced', random_state=42,
+        solver='lbfgs', multi_class='multinomial'), True),
+    ('Random Forest', lambda: RandomForestClassifier(
+        n_estimators=300, class_weight='balanced', random_state=42, n_jobs=-1), False),
+    ('Cascade Forest', lambda: CustomCascadeForest(
+        n_trees=100, max_layers=10, random_state=42), False),
+]
+ 
+for name, model_fn, needs_norm in models_to_compare:
+    print(f'\n--- {name} ---')
+ 
+    print('  [Static T0]')
+    r_static = evaluate_model(model_fn, X_T0, y,
+        model_name=f'{name} (Static)', normalize=needs_norm)
+ 
+    print('  [Temporal T0+T1]')
+    r_temporal = evaluate_model(model_fn, X_temporal, y,
+        model_name=f'{name} (Temporal)', normalize=needs_norm)
+ 
+    comparison_rows.append({
+        'Model': name,
+        'Static Acc': f"{r_static['mean_acc']:.3f}±{r_static['std_acc']:.3f}",
+        'Temporal Acc': f"{r_temporal['mean_acc']:.3f}±{r_temporal['std_acc']:.3f}",
+        'Δ Acc': f"{r_temporal['mean_acc'] - r_static['mean_acc']:+.3f}",
+    })
+ 
+print('\n' + pd.DataFrame(comparison_rows).to_string(index=False))
+\end{lstlisting}
+ 
+\subsubsection*{Συμπεράσματα}
+ 

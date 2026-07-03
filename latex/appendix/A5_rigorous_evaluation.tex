@@ -1,0 +1,466 @@
+\subsection{A.5 Αυστηρή Στατιστική Αξιολόγηση}
+ 
+\noindent \textbf{Πηγή:} \texttt{Final\_Rigorous\_Evaluation.ipynb}
+ 
+ 
+\subsubsection*{Final Rigorous Evaluation}
+ 
+\begin{lstlisting}
+!pip install xgboost imbalanced-learn -q
+print('Installations complete ✓')
+\end{lstlisting}
+ 
+\begin{lstlisting}
+import numpy as np
+import pandas as pd
+import warnings
+warnings.filterwarnings('ignore')
+ 
+from sklearn.model_selection import (
+    StratifiedKFold, RepeatedStratifiedKFold, GridSearchCV,
+    cross_val_score, permutation_test_score, learning_curve
+)
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import (
+    accuracy_score, f1_score, confusion_matrix, brier_score_loss,
+    classification_report, roc_auc_score
+)
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+from sklearn.pipeline import Pipeline
+from sklearn.calibration import calibration_curve, CalibratedClassifierCV
+ 
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+ 
+SEED = 42
+np.random.seed(SEED)
+print('Setup complete ✓')
+\end{lstlisting}
+ 
+\begin{lstlisting}
+SAMPLES_PATH = '/content/DIOPTRA_Samples_list_Oncology.xlsx'
+PROTEINS_PATH = '/content/DIOPTRA_Protein_results_Oncology.xlsx'
+\end{lstlisting}
+ 
+\begin{lstlisting}
+def load_data(samples_path, proteins_path, include_t00=True):
+    samples = pd.read_excel(samples_path)
+    proteins = pd.read_excel(proteins_path)
+    data = samples.merge(proteins, on='SampleID')
+    protein_cols = [c for c in proteins.columns if c != 'SampleID']
+    t0_data = data[data['Timepoint'] == 'T0'].copy()
+    t1_data = data[data['Timepoint'] == 'T1'].copy()
+    t0_data['PatientID'] = t0_data['SampleID']
+    t1_data['PatientID'] = t1_data['SampleID'].str.replace('-F', '', regex=False)
+    paired = t0_data.merge(t1_data[['PatientID'] + protein_cols], on='PatientID', suffixes=('_T0', '_T1'))
+    print(f'Paired: {len(paired)}')
+    if include_t00:
+        t00_data = data[data['Timepoint'] == 'T00'].copy()
+        for col in protein_cols:
+            t00_data[f'{col}_T0'] = t00_data[col]
+            t00_data[f'{col}_T1'] = t00_data[col]
+        t00_data['PatientID'] = t00_data['SampleID']
+        cols_needed = ['PatientID', 'Group'] + [f'{c}_T0' for c in protein_cols] + [f'{c}_T1' for c in protein_cols]
+        combined = pd.concat([paired[cols_needed], t00_data[cols_needed]], ignore_index=True)
+    else:
+        combined = paired
+    combined = combined[combined['Group'] != 'NAA']
+    X_T0 = combined[[f'{c}_T0' for c in protein_cols]].values
+    X_T1 = combined[[f'{c}_T1' for c in protein_cols]].values
+    X = np.stack([X_T0, X_T1], axis=1)
+    label_encoder = LabelEncoder()
+    y = label_encoder.fit_transform(combined['Group'].values)
+    print(f'Class distribution:')
+    for i, cls in enumerate(label_encoder.classes_):
+        print(f'  {cls}: {(y == i).sum()}')
+    return X, y, protein_cols, label_encoder
+ 
+X_raw, y, protein_names, label_encoder = load_data(SAMPLES_PATH, PROTEINS_PATH)
+class_names = list(label_encoder.classes_)
+\end{lstlisting}
+ 
+\begin{lstlisting}
+# Preprocessing
+n_samples, n_timepoints, n_proteins = X_raw.shape
+valid_mask = ~np.all(np.isnan(X_raw), axis=(0, 1))
+X_raw = X_raw[:, :, valid_mask]
+protein_names = [p for p, v in zip(protein_names, valid_mask) if v]
+imputer = SimpleImputer(strategy='median')
+X_imp = np.zeros_like(X_raw)
+for t in range(n_timepoints):
+    X_imp[:, t, :] = imputer.fit_transform(X_raw[:, t, :])
+X_raw = X_imp
+ 
+# Feature Selection: Top 15 (όπως στο previous)
+K = 15
+selector = SelectKBest(f_classif, k=K)
+selector.fit(X_raw[:, 0, :], y)
+selected_idx = np.where(selector.get_support())[0]
+X_selected = X_raw[:, :, selected_idx]
+selected_proteins = [protein_names[i] for i in selected_idx]
+ 
+# Temporal feature matrix
+X = np.hstack([X_selected[:, 0, :], X_selected[:, 1, :]])
+print(f'X shape: {X.shape}, N={len(y)}, Classes={class_names}')
+\end{lstlisting}
+ 
+\subsubsection*{1. Nested Cross-Validation (Αμερόληπτη Εκτίμηση)}
+ 
+\begin{lstlisting}
+# === Nested CV για LR ===
+print('='*70)
+print('NESTED CROSS-VALIDATION: Logistic Regression')
+print('='*70)
+ 
+outer_cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
+inner_cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=SEED)
+ 
+lr_grid = {'clf__C': [0.001, 0.01, 0.1, 0.5, 1.0, 5.0, 10.0, 50.0]}
+ 
+pipe = Pipeline([
+    ('scaler', StandardScaler()),
+    ('clf', LogisticRegression(
+        max_iter=2000, class_weight='balanced',
+        random_state=SEED, solver='lbfgs', multi_class='multinomial'
+    ))
+])
+ 
+gs = GridSearchCV(pipe, lr_grid, cv=inner_cv, scoring='accuracy', n_jobs=-1)
+ 
+# Nested CV
+nested_scores = []
+best_Cs = []
+ 
+for fold, (train_idx, val_idx) in enumerate(outer_cv.split(X, y), 1):
+    X_train, X_val = X[train_idx], X[val_idx]
+    y_train, y_val = y[train_idx], y[val_idx]
+ 
+    gs.fit(X_train, y_train)
+    val_acc = gs.score(X_val, y_val)
+    best_C = gs.best_params_['clf__C']
+ 
+    nested_scores.append(val_acc)
+    best_Cs.append(best_C)
+    print(f'  Fold {fold}: Best C={best_C}, Val Acc={val_acc:.3f}')
+ 
+nested_mean = np.mean(nested_scores)
+nested_std = np.std(nested_scores)
+print(f'\n>>> Nested CV: Acc = {nested_mean:.3f} ± {nested_std:.3f}')
+print(f'>>> Naive tuning (prev notebook): 0.662 ± 0.095')
+print(f'>>> Bias correction: {nested_mean - 0.662:+.3f}')
+print(f'\nSelected C values per fold: {best_Cs}')
+\end{lstlisting}
+ 
+\subsubsection*{2. Repeated Cross-Validation}
+ 
+\begin{lstlisting}
+# === Repeated CV ===
+print('='*70)
+print('REPEATED CROSS-VALIDATION (10 × 5-fold)')
+print('='*70)
+ 
+# Pipeline (με τη βέλτιστη C από το naive tuning)
+best_C = 0.5  # Από το προηγούμενο notebook
+ 
+pipe_best = Pipeline([
+    ('scaler', StandardScaler()),
+    ('clf', LogisticRegression(
+        max_iter=2000, class_weight='balanced',
+        random_state=SEED, solver='lbfgs',
+        multi_class='multinomial', C=best_C
+    ))
+])
+ 
+rkf = RepeatedStratifiedKFold(n_splits=5, n_repeats=10, random_state=SEED)
+rep_scores = cross_val_score(pipe_best, X, y, cv=rkf, scoring='accuracy', n_jobs=-1)
+ 
+print(f'  Total folds: {len(rep_scores)}')
+print(f'  Mean Acc: {rep_scores.mean():.3f} ± {rep_scores.std():.3f}')
+print(f'  Min: {rep_scores.min():.3f}  |  Max: {rep_scores.max():.3f}')
+print(f'  Median: {np.median(rep_scores):.3f}')
+ 
+# Distribution plot
+fig, ax = plt.subplots(figsize=(10, 4))
+ax.hist(rep_scores, bins=15, color='#1D9E75', alpha=0.7, edgecolor='white')
+ax.axvline(rep_scores.mean(), color='darkred', linestyle='--', linewidth=2,
+           label=f'Mean = {rep_scores.mean():.3f}')
+ax.axvline(1/3, color='gray', linestyle=':', label='Random (33%)')
+ax.set_xlabel('Accuracy', fontsize=12)
+ax.set_ylabel('Frequency', fontsize=12)
+ax.set_title(f'Distribution of Accuracy across 50 folds (LR, C={best_C})', fontsize=12)
+ax.legend()
+plt.tight_layout()
+plt.savefig('repeated_cv_distribution.png', dpi=150, bbox_inches='tight')
+plt.show()
+\end{lstlisting}
+ 
+\subsubsection*{3. Permutation Test}
+ 
+\begin{lstlisting}
+# === Permutation Test ===
+print('='*70)
+print('PERMUTATION TEST (1000 permutations)')
+print('='*70)
+print('This will take a few minutes...')
+ 
+score, perm_scores, pvalue = permutation_test_score(
+    pipe_best, X, y,
+    scoring='accuracy',
+    cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED),
+    n_permutations=1000,
+    random_state=SEED,
+    n_jobs=-1
+)
+ 
+print(f'\n  Real accuracy: {score:.3f}')
+print(f'  Random permutation mean: {perm_scores.mean():.3f}')
+print(f'  Permutation std: {perm_scores.std():.3f}')
+print(f'  p-value: {pvalue:.4f}')
+print(f'\n>>> {"STATISTICALLY SIGNIFICANT" if pvalue < 0.05 else "NOT significant"}: p {"<" if pvalue < 0.05 else ">="} 0.05')
+ 
+# Plot
+fig, ax = plt.subplots(figsize=(10, 4))
+ax.hist(perm_scores, bins=30, color='gray', alpha=0.6, edgecolor='white',
+        label=f'Permuted labels (n=1000)')
+ax.axvline(score, color='darkred', linestyle='-', linewidth=3,
+           label=f'Real score = {score:.3f}')
+ax.axvline(1/3, color='blue', linestyle=':', alpha=0.5, label='Random (33%)')
+ax.set_xlabel('Accuracy', fontsize=12)
+ax.set_ylabel('Frequency', fontsize=12)
+ax.set_title(f'Permutation Test: Is 66% significantly better than random?\n'
+             f'p-value = {pvalue:.4f}', fontsize=12)
+ax.legend()
+plt.tight_layout()
+plt.savefig('permutation_test.png', dpi=150, bbox_inches='tight')
+plt.show()
+\end{lstlisting}
+ 
+\subsubsection*{4. Bootstrap Confidence Intervals}
+ 
+\begin{lstlisting}
+# === Bootstrap CI ===
+print('='*70)
+print('BOOTSTRAP 95% CONFIDENCE INTERVAL')
+print('='*70)
+ 
+# Χρησιμοποιούμε τα 50 scores από Repeated CV
+n_bootstrap = 2000
+bootstrap_means = []
+ 
+rng = np.random.RandomState(SEED)
+for _ in range(n_bootstrap):
+    sample = rng.choice(rep_scores, size=len(rep_scores), replace=True)
+    bootstrap_means.append(sample.mean())
+ 
+bootstrap_means = np.array(bootstrap_means)
+ci_lower = np.percentile(bootstrap_means, 2.5)
+ci_upper = np.percentile(bootstrap_means, 97.5)
+ 
+print(f'  Point estimate: {rep_scores.mean():.3f}')
+print(f'  Bootstrap mean: {bootstrap_means.mean():.3f}')
+print(f'  95% CI: [{ci_lower:.3f}, {ci_upper:.3f}]')
+print(f'  Width: {ci_upper - ci_lower:.3f}')
+ 
+# Plot
+fig, ax = plt.subplots(figsize=(10, 4))
+ax.hist(bootstrap_means, bins=40, color='#1D9E75', alpha=0.7, edgecolor='white')
+ax.axvline(rep_scores.mean(), color='darkred', linestyle='-', linewidth=2, label='Point estimate')
+ax.axvline(ci_lower, color='orange', linestyle='--', linewidth=2, label=f'2.5%: {ci_lower:.3f}')
+ax.axvline(ci_upper, color='orange', linestyle='--', linewidth=2, label=f'97.5%: {ci_upper:.3f}')
+ax.set_xlabel('Bootstrap Mean Accuracy', fontsize=12)
+ax.set_ylabel('Frequency', fontsize=12)
+ax.set_title(f'Bootstrap Distribution (n={n_bootstrap})\n95% CI: [{ci_lower:.3f}, {ci_upper:.3f}]', fontsize=12)
+ax.legend()
+plt.tight_layout()
+plt.savefig('bootstrap_ci.png', dpi=150, bbox_inches='tight')
+plt.show()
+\end{lstlisting}
+ 
+\subsubsection*{5. Learning Curve}
+ 
+\begin{lstlisting}
+# === Learning Curve ===
+print('='*70)
+print('LEARNING CURVE ANALYSIS')
+print('='*70)
+ 
+train_sizes = np.linspace(0.3, 1.0, 8)
+train_sizes_abs, train_scores, val_scores = learning_curve(
+    pipe_best, X, y,
+    train_sizes=train_sizes,
+    cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED),
+    scoring='accuracy',
+    n_jobs=-1,
+    random_state=SEED
+)
+ 
+train_mean = train_scores.mean(axis=1)
+train_std = train_scores.std(axis=1)
+val_mean = val_scores.mean(axis=1)
+val_std = val_scores.std(axis=1)
+ 
+# Plot
+fig, ax = plt.subplots(figsize=(10, 5))
+ax.plot(train_sizes_abs, train_mean, 'o-', color='#E24B4A', label='Training')
+ax.fill_between(train_sizes_abs, train_mean - train_std, train_mean + train_std,
+                color='#E24B4A', alpha=0.2)
+ax.plot(train_sizes_abs, val_mean, 'o-', color='#1D9E75', label='Validation')
+ax.fill_between(train_sizes_abs, val_mean - val_std, val_mean + val_std,
+                color='#1D9E75', alpha=0.2)
+ax.axhline(y=1/3, color='gray', linestyle='--', alpha=0.5, label='Random (33%)')
+ax.set_xlabel('Training Set Size', fontsize=12)
+ax.set_ylabel('Accuracy', fontsize=12)
+ax.set_title('Learning Curve (LR, C=0.5)', fontsize=13)
+ax.legend(loc='lower right')
+ax.grid(alpha=0.3)
+plt.tight_layout()
+plt.savefig('learning_curve.png', dpi=150, bbox_inches='tight')
+plt.show()
+ 
+gap = train_mean[-1] - val_mean[-1]
+print(f'\n  Final train acc: {train_mean[-1]:.3f}')
+print(f'  Final val acc:   {val_mean[-1]:.3f}')
+print(f'  Train-Val gap:   {gap:.3f}')
+if gap > 0.15:
+    print('  >>> ΥΠΑΡΧΕΙ overfitting - περισσότερα δεδομένα θα βοηθούσαν')
+elif gap > 0.08:
+    print('  >>> Μικρό gap - μερικά παραπάνω δεδομένα θα βοηθούσαν')
+else:
+    print('  >>> Μικρό gap - το μοντέλο γενικεύει καλά')
+\end{lstlisting}
+ 
+\subsubsection*{6. Calibration Analysis}
+ 
+\begin{lstlisting}
+# === Calibration Analysis ===
+print('='*70)
+print('CALIBRATION ANALYSIS')
+print('='*70)
+ 
+from sklearn.model_selection import cross_val_predict
+ 
+# Cross-validated probabilities
+proba_cv = cross_val_predict(
+    pipe_best, X, y, cv=5, method='predict_proba', n_jobs=-1
+)
+ 
+# Για κάθε κλάση, reliability diagram
+fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+ 
+for idx, class_name in enumerate(class_names):
+    y_binary = (y == idx).astype(int)
+    proba_class = proba_cv[:, idx]
+ 
+    # Bin predictions and compute empirical probability
+    fraction_pos, mean_pred = calibration_curve(y_binary, proba_class, n_bins=5)
+ 
+    axes[idx].plot([0, 1], [0, 1], 'k:', label='Perfect calibration')
+    axes[idx].plot(mean_pred, fraction_pos, 'o-', color='#1D9E75',
+                   linewidth=2, markersize=8, label='LR (C=0.5)')
+    axes[idx].set_xlabel('Mean predicted probability', fontsize=11)
+    axes[idx].set_ylabel('Fraction of positives', fontsize=11)
+    axes[idx].set_title(f'Class: {class_name}', fontsize=12)
+    axes[idx].legend()
+    axes[idx].grid(alpha=0.3)
+    axes[idx].set_xlim(0, 1)
+    axes[idx].set_ylim(0, 1)
+ 
+    # Brier score
+    brier = brier_score_loss(y_binary, proba_class)
+    print(f'  {class_name}: Brier score = {brier:.3f}')
+ 
+plt.suptitle('Reliability Diagrams (per class)', fontsize=13, y=1.02)
+plt.tight_layout()
+plt.savefig('calibration.png', dpi=150, bbox_inches='tight')
+plt.show()
+ 
+print('\nNote: Brier score closer to 0 = better calibration (perfect = 0, random ≈ 0.25 for balanced binary)')
+\end{lstlisting}
+ 
+\subsubsection*{7. Per-Class Performance Analysis}
+ 
+\begin{lstlisting}
+# === Detailed Classification Report ===
+print('='*70)
+print('PER-CLASS PERFORMANCE (5-Fold CV predictions)')
+print('='*70)
+ 
+y_pred_cv = cross_val_predict(pipe_best, X, y, cv=5, n_jobs=-1)
+ 
+print('\nClassification Report:')
+print(classification_report(y, y_pred_cv, target_names=class_names, digits=3))
+ 
+# Κλινικά σημαντικές μετρικές
+print('\nΚλινικά Σημαντικές Μετρικές:')
+for idx, cls in enumerate(class_names):
+    y_bin = (y == idx).astype(int)
+    y_pred_bin = (y_pred_cv == idx).astype(int)
+ 
+    tp = ((y_bin == 1) & (y_pred_bin == 1)).sum()
+    tn = ((y_bin == 0) & (y_pred_bin == 0)).sum()
+    fp = ((y_bin == 0) & (y_pred_bin == 1)).sum()
+    fn = ((y_bin == 1) & (y_pred_bin == 0)).sum()
+ 
+    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0  # Recall
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+    ppv = tp / (tp + fp) if (tp + fp) > 0 else 0  # Precision
+    npv = tn / (tn + fn) if (tn + fn) > 0 else 0
+ 
+    print(f'\n  {cls} (n={y_bin.sum()}):')
+    print(f'    Sensitivity (Recall): {sensitivity:.3f}')
+    print(f'    Specificity:          {specificity:.3f}')
+    print(f'    PPV (Precision):      {ppv:.3f}')
+    print(f'    NPV:                  {npv:.3f}')
+\end{lstlisting}
+ 
+\subsubsection*{8. Τελική Σύνοψη}
+ 
+\begin{lstlisting}
+# === Summary ===
+print('='*70)
+print('FINAL SUMMARY: Rigorous Evaluation of LR (C=0.5)')
+print('='*70)
+ 
+summary = {
+    'Metric': [
+        'Naive 5-Fold CV (biased)',
+        'Nested CV (unbiased)',
+        'Repeated 10×5-Fold CV',
+        'Bootstrap 95% CI',
+        'Permutation Test p-value',
+        'Train-Val Gap',
+    ],
+    'Value': [
+        '0.662 ± 0.095',
+        f'{nested_mean:.3f} ± {nested_std:.3f}',
+        f'{rep_scores.mean():.3f} ± {rep_scores.std():.3f}',
+        f'[{ci_lower:.3f}, {ci_upper:.3f}]',
+        f'{pvalue:.4f} {"(significant)" if pvalue < 0.05 else "(NOT significant)"}',
+        f'{gap:.3f}',
+    ]
+}
+ 
+df_summary = pd.DataFrame(summary)
+print(df_summary.to_string(index=False))
+ 
+# Save
+df_summary.to_csv('final_evaluation.csv', index=False)
+ 
+# Συμπέρασμα
+print('\n' + '='*70)
+print('ΣΥΜΠΕΡΑΣΜΑ:')
+print('='*70)
+if pvalue < 0.05:
+    print(f'✓ Το μοντέλο είναι στατιστικά σημαντικό (p={pvalue:.4f})')
+if ci_lower > 1/3:
+    print(f'✓ 95% CI πάνω από τυχαίο ({ci_lower:.3f} > 0.333)')
+print(f'✓ Αμερόληπτη εκτίμηση: {nested_mean:.3f} (vs naive {0.662:.3f})')
+print(f'✓ Σταθερή απόδοση σε 50 folds: {rep_scores.mean():.3f} ± {rep_scores.std():.3f}')
+\end{lstlisting}
+
+
