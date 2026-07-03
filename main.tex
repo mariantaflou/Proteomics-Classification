@@ -1,0 +1,396 @@
+% !TEX program = xelatex
+% =====================================================================
+% Διπλωματική Εργασία - Μαρία Ντάφλου
+% Πρωτεομική Ταξινόμηση Ογκολογικών Ασθενών με Machine Learning
+%
+% Μεταγλώττιση: XeLaTeX (όχι pdfLaTeX, όχι LuaLaTeX)
+% =====================================================================
+
+\documentclass[12pt, a4paper]{article}
+
+% --- Geometry ---
+
+% --- Math ---
+\usepackage{amsmath,amssymb,amsfonts,mathtools}
+
+% --- Text Justification & Underline ---
+\usepackage{ragged2e}
+\usepackage[normalem]{ulem}
+
+% --- XeLaTeX: fonts & Greek support ---
+\usepackage{fontspec}
+
+\IfFontExistsTF{Liberation Serif}{%
+    \setmainfont{Liberation Serif}
+    \setsansfont{Liberation Sans}
+    \setmonofont{Liberation Mono}
+    \newcommand{\activeMainFont}{Liberation Serif}
+    \newcommand{\activeSansFont}{Liberation Sans}
+    \newcommand{\activeMonoFont}{Liberation Mono}
+}{%
+\IfFontExistsTF{Times New Roman}{%
+    \setmainfont{Times New Roman}
+    \setsansfont{Arial}
+    \setmonofont{Courier New}
+    \newcommand{\activeMainFont}{Times New Roman}
+    \newcommand{\activeSansFont}{Arial}
+    \newcommand{\activeMonoFont}{Courier New}
+}{%
+\IfFontExistsTF{Latin Modern Roman}{%
+    \setmainfont{Latin Modern Roman}
+    \setsansfont{Latin Modern Sans}
+    \setmonofont{Latin Modern Mono}
+    \newcommand{\activeMainFont}{Latin Modern Roman}
+    \newcommand{\activeSansFont}{Latin Modern Sans}
+    \newcommand{\activeMonoFont}{Latin Modern Mono}
+}{%
+    \PackageError{fontspec}{No suitable Greek-capable font found}{Install one of: Liberation Serif, Times New Roman, Latin Modern Roman}
+}}}
+
+% --- Paragraph Spacing ---
+\usepackage{parskip}
+
+% --- Polyglossia για διαχείριση Ελληνικών/Αγγλικών ---
+\usepackage{polyglossia}
+\setdefaultlanguage{greek}
+\setotherlanguage{english}
+
+% Ρητός ορισμός Greek font για polyglossia
+\newfontfamily\greekfont{\activeMainFont}
+\newfontfamily\greekfontsf{\activeSansFont}
+\newfontfamily\greekfonttt{\activeMonoFont}
+
+% --- Code listings ---
+\usepackage{listings}
+\usepackage{xcolor}
+
+\definecolor{codegreen}{rgb}{0.0, 0.5, 0.0}
+\definecolor{codegray}{rgb}{0.5, 0.5, 0.5}
+\definecolor{codepurple}{rgb}{0.58, 0, 0.82}
+\definecolor{codeblue}{rgb}{0.13, 0.13, 1.0}
+\definecolor{backcolour}{rgb}{0.97, 0.97, 0.94}
+
+\lstdefinestyle{pythonstyle}{
+  backgroundcolor=\color{backcolour},
+  commentstyle=\color{codegreen}\itshape,
+  keywordstyle=\color{codeblue}\bfseries,
+  numberstyle=\tiny\color{codegray},
+  stringstyle=\color{codepurple},
+  basicstyle=\ttfamily\scriptsize,
+  breakatwhitespace=false,
+  breaklines=true,
+  captionpos=b,
+  keepspaces=true,
+  numbers=left,
+  numbersep=5pt,
+  showspaces=false,
+  showstringspaces=false,
+  showtabs=false,
+  tabsize=2,
+  frame=single,
+  rulecolor=\color{black!30},
+  language=Python,
+  inputencoding=utf8,
+  extendedchars=true,
+}
+\lstset{style=pythonstyle}
+
+% --- Tables ---
+\usepackage{longtable,booktabs,array,multirow}
+\usepackage{makecell}
+
+% --- Graphics ---
+\usepackage{graphicx}
+
+% --- Hyperlinks ---
+\usepackage{hyperref}
+\hypersetup{
+  hidelinks,
+  unicode=true,
+}
+\usepackage{url}
+\urlstyle{same}
+
+% --- Disable auto numbering ---
+\setcounter{secnumdepth}{-\maxdimen}
+
+% --- Metadata ---
+\title{Ανάπτυξη μεθοδολογίας τεχνητής νοημοσύνης στην ανάλυση πρωτεομικών προφίλ για την αναγνώριση βιοδεικτών που σχετίζονται με την εξέλιξη του καρκίνου παχέος εντέρου.}
+\author{Μαρία Ελπίδα Ντάφλου}
+\date{Αθήνα, Ιούλιος 2026}
+
+
+% --- Αντιμετώπιση Overfull Lines στη Βιβλιογραφία & Links ---
+\usepackage{microtype} % Βελτιώνει δραματικά το spacing και το σπάσιμο των λέξεων
+\usepackage{xurl}      % Επιτρέπει στα URLs και DOIs να σπάνε σε ΟΠΟΙΟΔΗΠΟΤΕ σημείο της γραμμής
+
+% --- Geometry (Μειώθηκαν τα περιθώρια left/right σε 2.0cm) ---
+\usepackage[a4paper, left=2.0cm, right=2.0cm, top=3cm, bottom=3cm, bindingoffset=0.5cm]{geometry}
+
+% --- Πακέτα για Πίνακες (Προσθήκη του tabularx) ---
+\usepackage{longtable,booktabs,array,multirow}
+\usepackage{tabularx} 
+\usepackage{makecell}
+
+% =====================================================================
+\begin{document}
+
+% =====================================================================
+% ΕΞΩΦΥΛΛΟ
+% =====================================================================
+\begin{titlepage}
+\thispagestyle{empty}
+\begin{center}
+
+\begin{minipage}{0.22\textwidth}
+    \flushleft
+    \includegraphics[width=3.3cm]{NTUA-logo.png}
+\end{minipage}%
+\begin{minipage}{0.7\textwidth}
+    \flushleft
+    {\large
+    Εθνικό Μετσόβιο Πολυτεχνείο\\
+    Σχολή Ηλεκτρολόγων Μηχανικών \&\\
+    Μηχανικών Υπολογιστών\\
+    \vspace{0.3cm}
+    Toμέας Συστημάτων Μετάδοσης Πληροφορίας και Τεχνολογίας Υλικών}
+\end{minipage}
+
+\vspace*{3cm}
+
+{\LARGE\bfseries\uline{Ανάπτυξη μεθοδολογίας τεχνητής νοημοσύνης στην ανάλυση πρωτεομικών προφίλ
+για την αναγνώριση βιοδεικτών που σχετίζονται
+με την εξέλιξη του καρκίνου παχέος εντέρου}\par}
+
+\vspace{2.5cm}
+{\LARGE ΔΙΠΛΩΜΑΤΙΚΗ ΕΡΓΑΣΙΑ\par}
+
+\vspace{3cm}
+{\Large\underline{Μαρία Ελπίδα Ντάφλου}\par}
+
+\vspace{3cm}
+
+\flushleft{\large
+    \begin{tabular}{l l}
+    \textbf{Επιβλέπων}: & Γεώργιος Ματσόπουλος \\
+                        & Καθηγητής, ΕΜΠ\\
+    \end{tabular}
+}
+
+\vfill
+\begin{center}
+{\large Αθήνα, Ιούλιος 2026}
+\end{center}
+
+\end{center}
+\end{titlepage}
+
+% --- ΛΕΥΚΗ ΣΕΛΙΔΑ ΜΕΤΑ ΤΟ ΕΞΩΦΥΛΛΟ (Σελίδα 2) ---
+\clearpage
+\thispagestyle{empty}
+~
+\clearpage
+
+% =====================================================================
+% ΔΕΥΤΕΡΟ ΕΞΩΦΥΛΛΟ ΜΕ ΤΡΙΜΕΛΗ ΕΠΙΤΡΟΠΗ (Σελίδα 3)
+%// =====================================================================
+\thispagestyle{empty}
+\begin{minipage}{0.22\textwidth}
+    \flushleft
+    \includegraphics[width=3.3cm]{NTUA-logo.png}
+\end{minipage}%
+\begin{minipage}{0.7\textwidth}
+    \flushleft
+    {\large
+    Εθνικό Μετσόβιο Πολυτεχνείο\\
+    Σχολή Ηλεκτρολόγων Μηχανικών \&\\
+    Μηχανικών Υπολογιστών\\
+    \vspace{0.3cm}
+    Toμέας Συστημάτων Μετάδοσης Πληροφορίας και Τεχνολογίας Υλικών}
+\end{minipage}
+
+\vspace*{2cm}
+
+\begin{center}
+{\LARGE\bfseries\uline{Ανάπτυξη μεθοδολογίας τεχνητής νοημοσύνης στην ανάλυση πρωτεομικών προφίλ
+για την αναγνώριση βιοδεικτών που σχετίζονται
+με την εξέλιξη του καρκίνου παχέος εντέρου}\par}
+
+\vspace{2cm}
+{\LARGE ΔΙΠΛΩΜΑΤΙΚΗ ΕΡΓΑΣΙΑ\par}
+
+\vspace{1cm}
+{\Large\underline{Μαρία Ελπίδα Ντάφλου}\par}
+\end{center}
+
+\vspace{1cm}
+\flushleft{\large
+    \begin{tabular}{l l}
+    \textbf{Επιβλέπων}: & Γεώργιος Ματσόπουλος\\
+                        & Καθηγητής, ΕΜΠ\\
+    \end{tabular}
+}
+
+\vspace{1cm}
+{\large Εγκρίθηκε από την τριμελή εξεταστική επιτροπή την Ημέρα, Μήνας, Έτος.}\\
+\vspace{1cm}
+
+\begin{center}
+\small
+\begin{tabular}{p{0.28\textwidth} p{0.28\textwidth} p{0.28\textwidth}}
+\centering\dotfill & \centering\dotfill & \centering\dotfill\tabularnewline
+\centering Γεώργιος Ματσόπουλος & \centering Αθανάσιος Παναγόπουλος & \centering Ουρανία Πετροπούλου\tabularnewline
+\centering Καθηγητής, ΕΜΠ & \centering Καθηγητής, ΕΜΠ & \centering ΕΔΙΠ, ΕΜΠ\tabularnewline
+\end{tabular}
+\end{center}
+
+\vfill
+\begin{center}
+{\large Αθήνα, Ιούλιος 2026}
+\end{center}
+
+\newpage
+
+% =====================================================================
+% COPYRIGHT (Σελίδα 4)
+% =====================================================================
+\thispagestyle{empty}
+\noindent\underline{\hspace{5cm}}\\
+Μαρία Ελπίδα Ντάφλου\\
+Διπλωματούχος Ηλεκτρολόγος Μηχανικός και Μηχανικός Υπολογιστών Ε.Μ.Π.
+
+\vspace*{\fill}
+\noindent Copyright \copyright\ Μαρία Ελπίδα Ντάφλου, 2026.\\
+Με επιφύλαξη παντός δικαιώματος. All rights reserved.
+
+\vspace{0.5cm}
+Απαγορεύεται η αντιγραφή, αποθήκευση και διανοµή της παρούσας εργασίας, εξ ολοκλήρου ή τµήµατος αυτής, για εµπορικό σκοπό. Επιτρέπεται η ανατύπωση, αποθήκευση και διανοµή για σκοπό µη κερδοσκοπικό, εκπαιδευτικής ή ερευνητικής φύσης, υπό την προϋπόθεση να αναφέρεται η πηγή προέλευσης και να διατηρείται το παρόν µήνυµα. Ερωτήµατα που αφορούν τη χρήση της εργασίας για κερδοσκοπικό σκοπό πρέπει να απευθύνονται προς τον συγγραφέα.
+
+\vspace{0.5cm}
+Οι απόψεις και τα συμπεράσματα που περιέχονται σε αυτό το έγγραφο εκφράζουν τον συγγραφέα και δεν πρέπει να ερμηνευθεί ότι αντιπροσωπεύουν τις επίσημες θέσεις του Εθνικού Μετσόβιου Πολυτεχνείου.
+
+\newpage
+
+% =====================================================================
+% ΑΦΙΕΡΩΣΕΙΣ (Σελίδα 5)
+% =====================================================================
+\thispagestyle{empty}
+\vspace*{8cm}
+\begin{center}
+\textit{Στους ανθρώπους\\
+που με στήριξαν}
+\end{center}
+
+% --- ΛΕΥΚΗ ΣΕΛΙΔΑ ΜΕΤΑ ΤΙΣ ΑΦΙΕΡΩΣΕΙΣ (Σελίδα 6) ---
+\clearpage
+\thispagestyle{empty}
+~
+\clearpage
+
+% =====================================================================
+% ΠΕΡΙΛΗΨΗ (Σελίδα 7 - ΠΛΗΡΗΣ ΣΤΟΙΧΙΣΗ)
+% =====================================================================
+\pagenumbering{arabic} 
+\setcounter{page}{7}   
+\thispagestyle{plain}  
+
+\justifying % <--- Επιβάλλει Justify από εδώ και πέρα στο έγγραφο
+
+\section*{Περίληψη}
+\addcontentsline{toc}{section}{Περίληψη}
+
+Ο καρκίνος του παχέος εντέρου (Colorectal Cancer - CRC) αποτελεί την τρίτη συχνότερη μορφή καρκίνου παγκοσμίως, με τη φυσική του εξέλιξη, την Ακολουθία Αδενώματος-Καρκινώματος, να διαρκεί 10 έως 15 έτη και να προσφέρει ένα κρίσιμο παράθυρο για πρώιμη διάγνωση. Η παρούσα διπλωματική εργασία διερευνά τη δυνατότητα διαχρονικής πρωτεομικής ανάλυσης πλάσματος αίματος με μεθόδους Μηχανικής Μάθησης για την τριπλή ταξινόμηση ασθενών σε Healthy, Adenoma και Cancer, αξιοποιώντας μετρήσεις σε δύο χρονικά σημεία ($T_0$, $T_1$). Η μελέτη χρησιμοποιεί πρωτεομικά δεδομένα Φασματομετρίας Μάζας από $N = 62$ ασθενείς, μέσω μη επεμβατικής υγρής βιοψίας. Σχεδιάστηκαν και αξιολογήθηκαν πέντε διαδοχικά πειράματα: Vanilla RNN με μηχανισμό προσοχής, LSTM, σύγκριση μεθόδων συνόλου (Random Forest, Random Subspace, Rotation Forest, Custom Cascade Forest) και Logistic Regression, βελτιστοποίηση με GridSearch, Voting, Stacking και SMOTE, και αυστηρή στατιστική αξιολόγηση μέσω Nested CV, Permutation Tests και Bootstrap Confidence Intervals. Η αρχική υπόθεση ήταν ότι θα κυριαρχούσαν οι αρχιτεκτονικές Βαθιάς Μάθησης, ωστόσο τα πειράματα ανέδειξαν την \textbf{Logistic Regression }ως νικητή, έναντι Vanilla RNN και LSTM. Η χρονική πληροφορία ωφέλησε ιδιαίτερα τη γραμμική μοντελοποίηση ($+8.2\%$ έναντι του στατικού baseline), επιβεβαιώνοντας τη διαγνωστική αξία της διαχρονικής προσέγγισης. Για την κλάση CRC, το μοντέλο πέτυχε Sensitivity $68.8\%$, Specificity $84.8\%$ και NPV $88.6\%$, ενδείξεις δυνητικής χρησιμότητας ως εργαλείο πρώτου σταδίου ελέγχου (triage). Πέρα από την ταξινόμηση, εντοπίστηκαν τρεις πρωτεΐνες με σαφή βιολογική σημασία ως υποψήφιοι βιοδείκτες: η \textbf{MMP12} (Macrophage Metalloelastase), η \textbf{AREG} (Amphiregulin, EGFR ligand) και η \textbf{L1CAM} (L1 Cell Adhesion Molecule). Η L1CAM ιδιαίτερα, αν και κατέλαβε μόλις την 7η θέση στη μονομεταβλητή ANOVA ανάλυση, αναδείχθηκε ως το \#1 χαρακτηριστικό στην πολυμεταβλητή ανάλυση Random Forest, υποδεικνύοντας ότι η σημασία της εκδηλώνεται μέσω συνδυασμού με άλλες πρωτεΐνες.
+
+Η εργασία αναδεικνύει συγκεκριμένους υποψήφιους βιοδείκτες για τον CRC με στατιστικά σημαντικά αποτελέσματα και προτείνει ένα ολοκληρωμένο πλαίσιο σύγκρισης οικογενειών αλγορίθμων και αυστηρής στατιστικής επικύρωσης για βιοϊατρικά datasets μικρού μεγέθους.
+
+
+\vspace{4cm}
+\noindent\textbf{Λέξεις Κλειδιά:} Πρωτεομική, Καρκίνος του Παχέος Εντέρου, Διαχρονική Ανάλυση, Μηχανική Μάθηση, Βιοδείκτες
+
+% --- ΛΕΥΚΗ ΣΕΛΙΔΑ ΜΕΤΑ ΤΗΝ ΠΕΡΙΛΗΨΗ (Σελίδα 8) ---
+\clearpage
+\thispagestyle{empty}
+~
+\clearpage
+
+% =====================================================================
+% ABSTRACT (ENGLISH) (Σελίδα 9)
+% =====================================================================
+\thispagestyle{plain} 
+\begin{english}
+\justifying % Εξασφαλίζει justify και για το αγγλικό περιβάλλον
+\section*{Abstract}
+\addcontentsline{toc}{section}{Abstract}
+
+
+ Colorectal Cancer (CRC) is the third most common type of cancer worldwide. Its natural progression, known as the Adenoma-Carcinoma Sequence, typically spans 10 to 15 years, offering a critical window for early diagnosis. This diploma thesis investigates the potential of longitudinal proteomic plasma analysis combined with Machine Learning methods for the three-class classification of patients into Healthy, Adenoma, and Cancer categories, leveraging measurements at two timepoints ($T_0$ and $T_1$). The study uses Mass Spectrometry proteomic data from $N = 62$ patients, collected through non-invasive liquid biopsy. Five successive experiments were designed and evaluated: a Vanilla RNN with attention mechanism, an LSTM, a comparison of ensemble methods (Random Forest, Random Subspace, Rotation Forest, Custom Cascade Forest) and Logistic Regression, hyperparameter optimization with GridSearch, Voting, Stacking, and SMOTE, and rigorous statistical evaluation via Nested Cross-Validation, Permutation Tests, and Bootstrap Confidence Intervals. The initial hypothesis was that Deep Learning architectures would prevail, yet the experiments revealed \textbf{Logistic Regression }as the winning model, outperforming both Vanilla RNN and LSTM. The longitudinal information proved especially beneficial to linear modeling (a gain of $+8.2\%$ over the static baseline), confirming the diagnostic value of the temporal approach. For the minority CRC class, the model achieved Sensitivity $68.8\%$, Specificity $84.8\%$, and NPV $88.6\%$, indicating potential utility as a first-line triage tool. Beyond classification, three proteins emerged with clear biological significance as candidate biomarkers: \textbf{MMP12} (Macrophage Metalloelastase), \textbf{AREG} (Amphiregulin, an EGFR ligand), and \textbf{L1CAM} (L1 Cell Adhesion Molecule). Notably, L1CAM ranked only 7th in univariate ANOVA but emerged as the \#1 feature in multivariate Random Forest analysis, indicating that its importance is expressed through combinations with other proteins.
+
+This work contributes on two levels: empirically, it identifies specific candidate biomarkers for CRC with statistically significant results; methodologically, it proposes an integrated framework for comparing algorithm families and rigorous statistical validation for small-N biomedical datasets.
+
+\vspace{4cm}
+\noindent\textbf{Keywords:} Proteomics, Colorectal Cancer, Longitudinal Analysis, Machine Learning, Biomarkers
+\end{english}
+
+% --- ΛΕΥΚΗ ΣΕΛΙΔΑ ΜΕΤΑ ΤΟ ABSTRACT (Σελίδα 10) ---
+\clearpage
+\thispagestyle{empty}
+~
+\clearpage
+
+% =====================================================================
+% ΕΥΧΑΡΙΣΤΙΕΣ (Σελίδα 11)
+% =====================================================================
+\thispagestyle{plain}
+\section*{Ευχαριστίες}
+\addcontentsline{toc}{section}{Ευχαριστίες}
+
+
+Καταρχάς, ευχαριστώ ιδιαίτερα ..............
+
+Ευχαριστώ επίσης ............
+
+
+\vspace{1cm}
+\hfill\textit{Μαρία Ελπίδα Ντάφλου}\\
+\hspace*{\fill}\textit{Αθήνα, Ιούλιος 2026}
+
+% --- ΛΕΥΚΗ ΣΕΛΙΔΑ ΜΕΤΑ ΤΙΣ ΕΥΧΑΡΙΣΤΙΕΣ (Σελίδα 12) ---
+\clearpage
+\thispagestyle{empty}
+~
+\clearpage
+
+% =====================================================================
+% ΠΕΡΙΕΧΟΜΕΝΑ (Σελίδα 13)
+% =====================================================================
+\thispagestyle{plain}
+\renewcommand{\contentsname}{Περιεχόμενα}
+\tableofcontents
+\newpage
+
+% =====================================================================
+% ΣΩΜΑ ΕΡΓΑΣΙΑΣ - ΚΕΦΑΛΑΙΑ
+% =====================================================================
+\input{chapters/chapter1_introduction}
+\input{chapters/chapter2_background}
+\input{chapters/chapter3_methodology}
+\input{chapters/chapter4_experiments}
+\input{chapters/chapter5_discussion}
+\input{chapters/chapter6_conclusions}
+
+% =====================================================================
+% ΒΙΒΛΙΟΓΡΑΦΙΑ
+% =====================================================================
+\input{chapters/references}
+
+% =====================================================================
+% ΠΑΡΑΡΤΗΜΑ
+% =====================================================================
+\input{appendix/appendix_intro}
+\input{appendix/A1_vanilla_rnn}
+\input{appendix/A2_lstm}
+\input{appendix/A3_ensemble}
+\input{appendix/A4_optimization}
+\input{appendix/A5_rigorous_evaluation}
+
+\end{document}
